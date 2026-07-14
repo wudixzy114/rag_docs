@@ -145,6 +145,9 @@ class VisionImage:
         return {"type": "image_url", "image_url": {
             "url": f"data:{self.media_type};base64,{self._b64()}"}}
 
+    def to_gemini_block(self) -> dict:
+        return {"inline_data": {"mime_type": self.media_type, "data": self._b64()}}
+
 
 class LLMClient:
     """Thin, synchronous OpenAI-compatible chat client with retry/backoff.
@@ -200,6 +203,9 @@ class LLMClient:
     def _active_is_anthropic(self) -> bool:
         return self._active_provider().dialect == "anthropic"
 
+    def _active_is_gemini(self) -> bool:
+        return self._active_provider().dialect == "gemini"
+
     def _available_models(self, chain: list[str]) -> list[str]:
         with self._quota_lock:
             available = [model for model in chain
@@ -247,11 +253,13 @@ class LLMClient:
         max_tokens: int = 2048,
         task: str | None = None,
         model: str | None = None,
+        chain: list[str] | None = None,
     ) -> LLMResult:
         """Chat completion. `task` selects a per-task model (see LLMSettings.
-        model_for); `model` forces a specific model. On a per-model quota error
+        model_for); `model` forces a specific model; `chain` forces an explicit
+        fallback chain (e.g. the simple-task chain). On a per-model quota error
         the client walks the fallback chain automatically."""
-        chain = [model] if model else self.settings.chain_for(task)
+        chain = [model] if model else (chain or self.settings.chain_for(task))
 
         def _once() -> LLMResult:
             if self._active_is_anthropic():
@@ -259,6 +267,9 @@ class LLMClient:
                     system=system,
                     messages=[{"role": "user", "content": user}],
                     tools=None, temperature=temperature, max_tokens=max_tokens)
+            if self._active_is_gemini():
+                return self._gemini_responses(
+                    system=system, user=user, max_tokens=max_tokens)
             payload = {
                 "model": self._active_model(),
                 "messages": [
@@ -291,27 +302,30 @@ class LLMClient:
         Quality-first: this is how the pipeline reads source screenshots — the
         model's own vision is far more faithful than the pre-baked OCR. The
         fallback chain is the VISION-ONLY chain (settings.vision_chain): it
-        contains vision-capable (Claude) models exclusively, so a quota fallback
-        can never land on a text-only model that would silently drop the image.
-        If every vision model is quota-exhausted, this raises LLMQuotaError — the
-        caller records the image as unread rather than trusting a fabricated
-        transcription."""
+        contains vision-capable models exclusively (Claude + Gemini, both
+        multimodal), so a quota fallback can never land on a text-only model that
+        would silently drop the image. If every vision model is quota-exhausted,
+        this raises LLMQuotaError — the caller records the image as unread rather
+        than trusting a fabricated transcription."""
         chain = [model] if model else self.settings.vision_chain()
 
         def _once() -> LLMResult:
-            if not self._active_is_anthropic():
-                # Defensive: the vision chain is all-anthropic by construction, so
-                # this only fires if a caller forced a text-only `model=`. Refuse
-                # rather than send an image a text model will ignore.
-                raise LLMError(
-                    f"model {self._active_model()} is not vision-capable; "
-                    "refusing to send image content")
-            content = [img.to_anthropic_block() for img in images]
-            content.append({"type": "text", "text": user})
-            return self._anthropic_messages(
-                system=system,
-                messages=[{"role": "user", "content": content}],
-                tools=None, temperature=temperature, max_tokens=max_tokens)
+            if self._active_is_anthropic():
+                content = [img.to_anthropic_block() for img in images]
+                content.append({"type": "text", "text": user})
+                return self._anthropic_messages(
+                    system=system,
+                    messages=[{"role": "user", "content": content}],
+                    tools=None, temperature=temperature, max_tokens=max_tokens)
+            if self._active_is_gemini():
+                return self._gemini_responses(
+                    system=system, user=user, max_tokens=max_tokens, images=images)
+            # Defensive: vision chain is vision-capable by construction; this only
+            # fires if a caller forced a text-only model=. Refuse rather than send
+            # an image a text model will ignore and hallucinate around.
+            raise LLMError(
+                f"model {self._active_model()} is not vision-capable; "
+                "refusing to send image content")
 
         return self._with_model_fallback(chain, _once)
 
@@ -566,6 +580,52 @@ class LLMClient:
         except httpx.HTTPError as exc:
             raise LLMError(f"stream failed: {exc}") from exc
 
+    def _gemini_responses(self, *, system: str, user: str,
+                          max_tokens: int = 2048,
+                          images: "list[VisionImage] | None" = None) -> LLMResult:
+        """Gemini-native `/v1/responses` API (contents/parts). Used for cheap,
+        fast tasks (paraphrase) routed to Gemini-Flash, and as a multimodal vision
+        fallback. System text is prepended to the user turn (Gemini has no separate
+        system role here). Images become inline_data parts. Same retry +
+        quota/content-blocked handling as the other dialects."""
+        provider = self._active_provider()
+        url = provider.base_url.rstrip("/") + "/responses"
+        headers = {"Content-Type": "application/json"}
+        if provider.api_key:
+            headers["Authorization"] = f"Bearer {provider.api_key}"
+        text = (system + "\n\n" + user) if system else user
+        parts: list[dict] = []
+        for img in (images or []):
+            parts.append(img.to_gemini_block())
+        parts.append({"text": text})
+        payload = {
+            "model": self._active_model(),
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"maxOutputTokens": max_tokens},
+        }
+        last_err: Exception | None = None
+        for attempt in range(1, self.settings.max_retries + 1):
+            try:
+                resp = self._client.post(url, json=payload, headers=headers)
+                if resp.status_code == 429 and _is_quota_body(resp.text):
+                    raise LLMQuotaError(f"quota exhausted: {resp.text[:200]}")
+                if _is_content_blocked(resp.status_code, resp.text):
+                    raise LLMContentBlockedError(f"content blocked: {resp.text[:200]}")
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    raise LLMError(f"gateway {resp.status_code}: {resp.text[:200]}")
+                resp.raise_for_status()
+                return _gemini_result(resp.json(), self._active_model())
+            except (LLMQuotaError, LLMContentBlockedError):
+                raise
+            except (httpx.HTTPError, LLMError, KeyError, ValueError) as exc:
+                last_err = exc
+                wait = min(2 ** attempt, 10)
+                log.warning("gemini call failed (attempt %d/%d): %s; retry in %ds",
+                            attempt, self.settings.max_retries, exc, wait)
+                if attempt < self.settings.max_retries:
+                    time.sleep(wait)
+        raise LLMError(f"gateway failed after {self.settings.max_retries} attempts: {last_err}")
+
     def _post_chat(self, payload: dict) -> LLMResult:
         provider = self._active_provider()
         url = provider.base_url.rstrip("/") + "/chat/completions"
@@ -795,3 +855,29 @@ def _anthropic_result(data: dict, model: str) -> LLMResult:
     return LLMResult(text="".join(text_parts).strip(), usage=usage,
                      model=data.get("model", model), tool_calls=tool_calls,
                      finish_reason=data.get("stop_reason", "") or "")
+
+
+def _gemini_result(data: dict, model: str) -> LLMResult:
+    """Gemini `/v1/responses` response -> LLMResult. Text lives in
+    candidates[0].content.parts[*].text; a `thoughtSignature` sibling field is
+    ignored. finishReason maps to our finish_reason ('length' when truncated)."""
+    text_parts: list[str] = []
+    finish = ""
+    cands = data.get("candidates") or []
+    if cands:
+        cand = cands[0]
+        finish = str(cand.get("finishReason", "") or "")
+        for part in (cand.get("content") or {}).get("parts", []) or []:
+            if isinstance(part, dict) and part.get("text"):
+                text_parts.append(part["text"])
+    # Normalize Gemini's MAX_TOKENS finish reason to our 'length' sentinel so the
+    # struct gate's truncation check works uniformly across dialects.
+    if finish.upper() == "MAX_TOKENS":
+        finish = "length"
+    usage_raw = data.get("usageMetadata") or {}
+    pt = usage_raw.get("promptTokenCount", 0)
+    ct = usage_raw.get("candidatesTokenCount", 0)
+    usage = LLMUsage(prompt_tokens=pt, completion_tokens=ct,
+                     total_tokens=pt + ct, calls=1)
+    return LLMResult(text="".join(text_parts).strip(), usage=usage,
+                     model=data.get("modelVersion", model), finish_reason=finish)

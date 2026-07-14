@@ -35,7 +35,8 @@ def add_paraphrases(unit: QAUnit, llm: LLMClient, cache: Cache,
     try:
         r = llm.complete(system=PARAPHRASE_SYSTEM,
                          user=build_paraphrase_user(q, unit.answer, n),
-                         max_tokens=512, task="paraphrase")
+                         max_tokens=1024, task="paraphrase",
+                         chain=llm.settings.simple_chain())
         arr = parse_json_array(r.text) or []
     except LLMError as exc:
         log.warning("paraphrase failed for %r: %s", q[:40], exc)

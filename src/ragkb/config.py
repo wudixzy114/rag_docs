@@ -143,6 +143,9 @@ class LLMSettings(BaseSettings):
     # DeepSeek) would silently drop images and hallucinate a transcription. Empty
     # => derive from the general chain by keeping only Claude (anthropic) models.
     vision_models_raw: str = Field(default="", alias="JD_LLM_VISION_MODELS")
+    # Simple-task fallback chain (paraphrase etc.): fast/cheap models first, with
+    # a capable backstop. e.g. Gemini-3-Flash → Gemini-3.1-Pro → Sonnet.
+    simple_models_raw: str = Field(default="", alias="JD_LLM_SIMPLE_MODELS")
     timeout_seconds: float = Field(default=90.0, alias="JD_LLM_TIMEOUT")
     max_retries: int = Field(default=3, alias="JD_LLM_MAX_RETRIES")
 
@@ -153,6 +156,12 @@ class LLMSettings(BaseSettings):
         Static so the client can classify a per-call OVERRIDE model, not just
         the configured default."""
         return model.lower().startswith("claude")
+
+    @staticmethod
+    def model_is_gemini(model: str) -> bool:
+        """Gemini models speak the Gemini-native `/v1/responses` API (contents/
+        parts), NOT OpenAI or Anthropic. Routed to the 'gemini' dialect."""
+        return model.lower().startswith("gemini")
 
     @property
     def is_anthropic(self) -> bool:
@@ -174,6 +183,8 @@ class LLMSettings(BaseSettings):
         return [
             ProviderSpec(name="anthropic", base_url=self.anthropic_base,
                          api_key=self.api_key, dialect="anthropic"),
+            ProviderSpec(name="gemini", base_url=self.base_url.rstrip("/"),
+                         api_key=self.api_key, dialect="gemini"),
             ProviderSpec(name="openai", base_url=self.base_url.rstrip("/"),
                          api_key=self.api_key, dialect="openai"),
         ]
@@ -222,7 +233,12 @@ class LLMSettings(BaseSettings):
         for p in providers:
             if model in p.models:
                 return p
-        want = "anthropic" if self.model_is_anthropic(model) else "openai"
+        if self.model_is_anthropic(model):
+            want = "anthropic"
+        elif self.model_is_gemini(model):
+            want = "gemini"
+        else:
+            want = "openai"
         for p in providers:
             if p.dialect == want:
                 return p
@@ -267,20 +283,41 @@ class LLMSettings(BaseSettings):
                 chain.append(m)
         return chain
 
+    def _is_vision_capable(self, model: str) -> bool:
+        """Claude and Gemini are multimodal; DeepSeek etc. are text-only."""
+        return self.model_is_anthropic(model) or self.model_is_gemini(model)
+
     def vision_chain(self) -> list[str]:
-        """Fallback chain for VISION calls — vision-capable models ONLY. Drawn
-        from JD_LLM_VISION_MODELS if set, else the general chain filtered to
-        Claude (anthropic) models. Never includes a text-only model, so a
-        multimodal call can't silently degrade to one that drops the image."""
+        """Fallback chain for VISION calls — vision-capable models ONLY (Claude +
+        Gemini, both multimodal). Drawn from JD_LLM_VISION_MODELS if set, else the
+        general chain filtered to vision-capable models. Never includes a text-only
+        model, so a multimodal call can't silently degrade to one that drops the
+        image and fabricates a transcription."""
         raw = (self.vision_models_raw or "").strip()
         if raw:
             models = [m.strip() for m in raw.split(",") if m.strip()]
         else:
-            models = [m for m in self.fallback_chain if self.model_is_anthropic(m)]
-        # Keep only genuinely vision-capable (Claude) models, de-duped, order-stable.
+            models = [m for m in self.fallback_chain if self._is_vision_capable(m)]
         seen, out = set(), []
         for m in models:
-            if self.model_is_anthropic(m) and m not in seen:
+            if self._is_vision_capable(m) and m not in seen:
+                seen.add(m)
+                out.append(m)
+        return out or [self.model]
+
+    def simple_chain(self) -> list[str]:
+        """Fallback chain for SIMPLE tasks (paraphrase): fast/cheap models first
+        with a capable backstop. From JD_LLM_SIMPLE_MODELS, else falls back to the
+        general chain. Lets cheap-model work run on a different model (and thus a
+        separate quota pool) than the Opus-heavy complex tasks."""
+        raw = (self.simple_models_raw or "").strip()
+        if raw:
+            models = [m.strip() for m in raw.split(",") if m.strip()]
+        else:
+            models = self.fallback_chain
+        seen, out = set(), []
+        for m in models:
+            if m and m not in seen:
                 seen.add(m)
                 out.append(m)
         return out or [self.model]
