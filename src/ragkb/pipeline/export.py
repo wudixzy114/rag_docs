@@ -22,27 +22,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from ragkb.pipeline.scrub import scrub
 from ragkb.pipeline.units import QAUnit, SOPUnit
-
-# Redact obvious secrets before anything reaches a queryable store. Hostnames are
-# NOT scrubbed (they're often part of the legitimate answer, e.g. storage.jd.local
-# upgrade URLs); only credential-shaped tokens are.
-_SECRET_PATTERNS = [
-    re.compile(r"(?i)(authorization:\s*bearer\s+)[A-Za-z0-9._\-]+"),
-    re.compile(r"(?i)\b(api[_-]?key\s*[=:]\s*)[A-Za-z0-9._\-]{12,}"),
-    re.compile(r"(?i)\b(token\s*[=:]\s*)[A-Za-z0-9._\-]{16,}"),
-    re.compile(r"\b[0-9a-f]{32}\b"),                 # bare 32-hex (like the gateway key)
-]
-
-
-def scrub(text: str) -> str:
-    s = text or ""
-    for pat in _SECRET_PATTERNS:
-        if pat.groups:
-            s = pat.sub(lambda m: m.group(1) + "[REDACTED]", s)
-        else:
-            s = pat.sub("[REDACTED]", s)
-    return s
 
 
 @dataclass

@@ -91,3 +91,21 @@ def test_scrub_redacts_secrets_but_keeps_hostnames():
     assert "[REDACTED]" in scrub("Authorization: Bearer abc123def456")
     assert "[REDACTED]" in scrub("9de5dee757784f6abc44a43c93c11d20")   # 32-hex key
     assert "storage.jd.local" in scrub("wget http://storage.jd.local/x.sh")  # host kept
+
+
+def test_scrub_redacts_mac_and_private_ip():
+    """The gateway content-filter 400s on these; pre-scrub must remove them."""
+    s = scrub("网卡 MAC a2:16:80:bb:aa:2b, 内网 10.20.30.40 与 192.168.1.1, 链路 fe80::ecee:eeff:feee:eeee")
+    assert "a2:16:80:bb:aa:2b" not in s and "[MAC]" in s
+    assert "10.20.30.40" not in s and "192.168.1.1" not in s
+    assert "fe80::ecee" not in s
+    # A public IP is NOT scrubbed (sometimes legitimate example content).
+    assert "8.8.8.8" in scrub("dns 8.8.8.8")
+
+
+def test_content_blocked_detector():
+    from ragkb.llm.client import _is_content_blocked
+    body = '{"error":{"code":400,"message":"sensitive contain:[\\"MAC地址\\"]","status":"FAILED_PRECONDITION"}}'
+    assert _is_content_blocked(400, body)
+    assert not _is_content_blocked(200, body)
+    assert not _is_content_blocked(400, '{"error":"some other 400"}')

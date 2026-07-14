@@ -17,6 +17,7 @@ from ragkb.pipeline.prompts import (
     EXTRACT_SYSTEM, SOP_SYSTEM, build_extract_user, build_sop_user,
     build_images_block,
 )
+from ragkb.pipeline.scrub import scrub
 from ragkb.pipeline.units import Provenance, QAUnit, SOPUnit
 
 log = logging.getLogger(__name__)
@@ -26,11 +27,12 @@ _SOP_MAX_TOKENS = 6144
 
 
 def _section_images(sec: Section) -> list[dict]:
-    """Vision transcripts for the images in this section (own images only)."""
+    """Vision transcripts for the images in this section (own images only).
+    Scrubbed pre-send so gateway content-safety doesn't 400 on MAC/IP in a chart."""
     out = []
     for im in sec.images:
         out.append({"rel_path": im.rel_path,
-                    "transcript": im.vision_text or im.inline_ocr,
+                    "transcript": scrub(im.vision_text or im.inline_ocr),
                     "meaning": ""})
     return out
 
@@ -50,7 +52,7 @@ def extract_qa(doc: Document, sec: Section, llm: LLMClient,
     recorded on every unit so the struct gate can fail them and the orchestrator
     can retry with a larger budget."""
     images = _section_images(sec)
-    user = build_extract_user(sec.full_title, sec.title, sec.body,
+    user = build_extract_user(sec.full_title, sec.title, scrub(sec.body),
                               build_images_block(images))
     try:
         r = llm.complete(system=EXTRACT_SYSTEM, user=user,
@@ -76,7 +78,7 @@ def extract_sop(doc: Document, sec: Section, llm: LLMClient,
                 model: str | None = None) -> SOPUnit | None:
     """Clean a section into a whole-Markdown SOP + entry questions."""
     images = _section_images(sec)
-    user = build_sop_user(sec.full_title, sec.title, sec.body,
+    user = build_sop_user(sec.full_title, sec.title, scrub(sec.body),
                           build_images_block(images))
     try:
         r = llm.complete(system=SOP_SYSTEM, user=user,

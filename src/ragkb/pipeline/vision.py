@@ -18,6 +18,7 @@ import logging
 from ragkb.llm.client import LLMClient, LLMError, VisionImage
 from ragkb.parse.model import Document, Image
 from ragkb.pipeline.prompts import VISION_VERSION, VISION_SYSTEM, build_vision_user
+from ragkb.pipeline.scrub import scrub
 from ragkb.store.cache import Cache, key_for
 
 log = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def vision_read_image(img: Image, llm: LLMClient, cache: Cache,
     try:
         r = llm.complete_vision(
             system=VISION_SYSTEM,
-            user=build_vision_user(img.inline_ocr),
+            user=build_vision_user(scrub(img.inline_ocr)),
             images=[vi], max_tokens=_VISION_MAX_TOKENS, task="vision", model=model)
     except LLMError as exc:
         log.warning("vision read failed for %s: %s", img.rel_path, exc)

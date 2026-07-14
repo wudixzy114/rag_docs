@@ -47,10 +47,28 @@ class LLMQuotaError(LLMError):
     rather than burning its retry budget on a model that's out of quota."""
 
 
+class LLMContentBlockedError(LLMError):
+    """The gateway's content-safety filter rejected the request (HTTP 400,
+    status FAILED_PRECONDITION, body 'sensitive contain:[...]').
+
+    This is a DETERMINISTIC refusal — the same content will always be blocked, so
+    retrying (or advancing the fallback chain, which shares the same filter) is
+    pure waste. The client raises this immediately; the caller should pre-scrub
+    sensitive tokens (MAC/内网IP/密钥) before sending, or skip the item."""
+
+
 def _is_quota_body(text: str) -> bool:
     """Detect the gateway's per-model quota-exhausted signature in a 429 body."""
     t = text or ""
     return "配额" in t or '"code":2001' in t or '"code": 2001' in t
+
+
+def _is_content_blocked(status_code: int, text: str) -> bool:
+    """Detect the content-safety rejection (400 + sensitive/FAILED_PRECONDITION)."""
+    if status_code != 400:
+        return False
+    t = text or ""
+    return "sensitive contain" in t or "FAILED_PRECONDITION" in t
 
 
 def _drop_rejected_temperature(payload: dict, status_code: int, body: str) -> bool:
@@ -482,12 +500,17 @@ class LLMClient:
                     # Model out of quota: don't waste retries — surface to the
                     # fallback loop to switch models immediately.
                     raise LLMQuotaError(f"quota exhausted: {resp.text[:200]}")
+                if _is_content_blocked(resp.status_code, resp.text):
+                    # Content-safety refusal is deterministic — retrying the same
+                    # content always 400s. Surface immediately (no retry, no
+                    # fallback: the filter is gateway-wide).
+                    raise LLMContentBlockedError(f"content blocked: {resp.text[:200]}")
                 if resp.status_code == 429 or resp.status_code >= 500:
                     raise LLMError(f"gateway {resp.status_code}: {resp.text[:200]}")
                 resp.raise_for_status()
                 return _anthropic_result(resp.json(), self._active_model())
-            except LLMQuotaError:
-                raise  # bypass transient-retry; the fallback loop handles it
+            except (LLMQuotaError, LLMContentBlockedError):
+                raise  # bypass transient-retry; deterministic — no point retrying
             except (httpx.HTTPError, LLMError, KeyError, ValueError) as exc:
                 last_err = exc
                 wait = min(2 ** attempt, 10)
@@ -561,6 +584,8 @@ class LLMClient:
                     # Model out of quota: don't retry the same model — surface to
                     # the fallback loop so it switches models immediately.
                     raise LLMQuotaError(f"quota exhausted: {resp.text[:200]}")
+                if _is_content_blocked(resp.status_code, resp.text):
+                    raise LLMContentBlockedError(f"content blocked: {resp.text[:200]}")
                 if resp.status_code == 429 or resp.status_code >= 500:
                     raise LLMError(f"gateway {resp.status_code}: {resp.text[:200]}")
                 resp.raise_for_status()
@@ -596,8 +621,8 @@ class LLMClient:
                     tool_calls=tool_calls,
                     finish_reason=choice.get("finish_reason", "") or "",
                 )
-            except LLMQuotaError:
-                raise  # bypass transient-retry; the fallback loop switches models
+            except (LLMQuotaError, LLMContentBlockedError):
+                raise  # bypass transient-retry; deterministic — no point retrying
             except (httpx.HTTPError, LLMError, KeyError, ValueError) as exc:
                 last_err = exc
                 wait = min(2 ** attempt, 10)
