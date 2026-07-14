@@ -111,9 +111,9 @@ class Orchestrator:
             for k, s in enumerate(secs):
                 label = labels.get(s.sid, "qa")
                 if label == "qa":
-                    qa.extend(extract_qa(doc, s, self.llm))
+                    qa.extend(extract_qa(doc, s, self.llm, cache=self.cache))
                 elif label == "sop":
-                    u = extract_sop(doc, s, self.llm)
+                    u = extract_sop(doc, s, self.llm, cache=self.cache)
                     if u:
                         sop.append(u)
                 self.bus.publish("doc_progress", topic, stage="extract",

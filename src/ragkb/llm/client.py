@@ -157,7 +157,13 @@ class LLMClient:
     def __init__(self, settings: LLMSettings | None = None,
                  client: httpx.Client | None = None) -> None:
         self.settings = settings or get_llm_settings()
-        self._client = client or httpx.Client(timeout=self.settings.timeout_seconds)
+        # Explicit per-phase timeouts so no single request can hang the whole run.
+        # A hung connect/read is the failure we saw (process frozen with a healthy
+        # gateway). connect is short; read is the model's think+generate budget.
+        timeout = httpx.Timeout(
+            connect=15.0, read=self.settings.timeout_seconds,
+            write=30.0, pool=15.0)
+        self._client = client or httpx.Client(timeout=timeout)
         self._owns_client = client is None
         # Thread-local storage for the model in force during a call. The verify
         # stage runs multiple LLM calls concurrently in a ThreadPoolExecutor; a
