@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+output/.cache/
+.env
+知识库配对素材.zip
+input/
+.DS_Store
