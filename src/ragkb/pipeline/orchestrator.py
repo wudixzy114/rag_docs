@@ -87,6 +87,12 @@ class Orchestrator:
         self._results: dict[str, DocResult] = {}
         self._lock = threading.Lock()
         self._running = False
+        # Concurrency model (redesigned for throughput without nesting explosion):
+        # docs are processed ONE AT A TIME, but each doc fans its independent
+        # sections out to this many concurrent LLM calls. So total in-flight =
+        # _section_workers (not docs × sections). This is the single global
+        # ceiling; the vendored client is thread-safe so one client is shared.
+        self._section_workers = max(self.settings.max_workers, 8)
 
     # ---- per-document pipeline -------------------------------------------
     def _process_doc(self, md_path: Path) -> DocResult:
@@ -105,29 +111,47 @@ class Orchestrator:
             # 2. Classify sections.
             secs = [s for s in doc.iter_sections() if s.body.strip() or s.images]
             labels = classify_sections(secs, self.llm)
-            # 3. Extract per section by label.
+            # 3. Extract per section by label — CONCURRENTLY within the doc. All
+            #    sections of a doc are independent, so a thread pool turns a serial
+            #    per-section wait into parallel calls. Bounded by _section_workers
+            #    so total in-flight stays under the gateway's comfort zone.
             qa: list[QAUnit] = []
             sop: list[SOPUnit] = []
-            for k, s in enumerate(secs):
-                label = labels.get(s.sid, "qa")
-                if label == "qa":
-                    qa.extend(extract_qa(doc, s, self.llm, cache=self.cache))
-                elif label == "sop":
-                    u = extract_sop(doc, s, self.llm, cache=self.cache)
+            qa_secs = [s for s in secs if labels.get(s.sid, "qa") == "qa"]
+            sop_secs = [s for s in secs if labels.get(s.sid, "qa") == "sop"]
+            done = [0]
+            total = len(qa_secs) + len(sop_secs)
+
+            def _tick():
+                done[0] += 1
+                self.bus.publish("doc_progress", topic, stage="extract",
+                                 done=done[0], total=total)
+
+            with ThreadPoolExecutor(max_workers=self._section_workers) as pool:
+                qa_futs = [pool.submit(extract_qa, doc, s, self.llm, cache=self.cache)
+                           for s in qa_secs]
+                sop_futs = [pool.submit(extract_sop, doc, s, self.llm, cache=self.cache)
+                            for s in sop_secs]
+                for fut in as_completed(qa_futs):
+                    qa.extend(fut.result() or [])
+                    _tick()
+                for fut in as_completed(sop_futs):
+                    u = fut.result()
                     if u:
                         sop.append(u)
-                self.bus.publish("doc_progress", topic, stage="extract",
-                                 done=k + 1, total=len(secs))
+                    _tick()
             # 4. Layer 1 structural gate (retry truncated once with more tokens).
             for u in qa:
                 gate_qa(u)
             for u in sop:
                 gate_sop(u)
             qa = self._retry_truncated_qa(doc, secs, labels, qa)
-            # 5. Paraphrase (recall boost) — only for struct-ok units.
-            for u in qa:
-                if u.struct_ok:
-                    add_paraphrases(u, self.llm, self.cache)
+            # 5. Paraphrase (recall boost) — only for struct-ok units, CONCURRENTLY.
+            ok_units = [u for u in qa if u.struct_ok]
+            if ok_units:
+                with ThreadPoolExecutor(max_workers=self._section_workers) as pool:
+                    list(pool.map(
+                        lambda u: add_paraphrases(u, self.llm, self.cache), ok_units))
             res = DocResult(topic=topic, qa=qa, sop=sop)
             self._publish_units(topic, qa, sop)
             return res
@@ -195,15 +219,14 @@ class Orchestrator:
                 continue
             todo.append(p)
 
-        # Parallel per-doc processing.
-        workers = min(self.settings.max_workers, max(1, len(todo)))
-        if todo:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {pool.submit(self._process_doc, p): p for p in todo}
-                for fut in as_completed(futs):
-                    res = fut.result()
-                    with self._lock:
-                        self._results[res.topic] = res
+        # Docs processed SERIALLY — each doc fans its sections out concurrently
+        # (see _process_doc), so parallelism lives at the section level and total
+        # in-flight is bounded by _section_workers. Serial docs also give clean
+        # per-doc progress and keep one doc's failure isolated.
+        for p in todo:
+            res = self._process_doc(p)
+            with self._lock:
+                self._results[res.topic] = res
 
         # Global consolidation across everything we have (fresh + previously done
         # non-pinned results in memory this run).
