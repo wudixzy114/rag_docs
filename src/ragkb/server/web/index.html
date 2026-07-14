@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>诊断知识库流水线</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#181b22; --panel2:#1f232c; --line:#2a2f3a;
+    --fg:#e6e8ee; --muted:#8b93a3; --accent:#4f9dff;
+    --ok:#3fb96a; --warn:#e0a53f; --err:#e0554f; --pin:#c07bf0;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; position:sticky; top:0; background:var(--bg); z-index:10; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  .btn { background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
+  .btn:hover { border-color:var(--accent); }
+  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .spacer { flex:1; }
+  .stats { display:flex; gap:18px; color:var(--muted); font-size:13px; }
+  .stats b { color:var(--fg); }
+  .wrap { display:grid; grid-template-columns:340px 1fr; gap:0; height:calc(100vh - 53px); }
+  .sidebar { border-right:1px solid var(--line); overflow-y:auto; padding:12px; }
+  .main { overflow-y:auto; padding:16px 20px; }
+  .doc { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:10px; cursor:pointer; }
+  .doc:hover { border-color:var(--accent); }
+  .doc.sel { border-color:var(--accent); }
+  .doc-top { display:flex; align-items:center; gap:8px; }
+  .doc-name { font-weight:600; font-size:13px; flex:1; word-break:break-all; }
+  .dot { width:8px; height:8px; border-radius:50%; flex:none; }
+  .s-pending{background:var(--muted)} .s-running{background:var(--accent); animation:pulse 1s infinite}
+  .s-done{background:var(--ok)} .s-failed{background:var(--err)} .s-pinned{background:var(--pin)}
+  .s-skipped{background:#556}
+  @keyframes pulse { 50%{opacity:.35} }
+  .doc-meta { color:var(--muted); font-size:12px; margin-top:4px; display:flex; gap:10px; flex-wrap:wrap; }
+  .doc-actions { margin-top:8px; display:flex; gap:6px; }
+  .doc-actions .btn { padding:3px 8px; font-size:12px; }
+  .bar { height:4px; background:var(--panel2); border-radius:2px; margin-top:8px; overflow:hidden; }
+  .bar > i { display:block; height:100%; background:var(--accent); width:0; transition:width .3s; }
+  .unit { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin-bottom:10px; }
+  .unit.sop { border-left:3px solid var(--pin); }
+  .unit.qa { border-left:3px solid var(--accent); }
+  .unit .q { font-weight:600; margin-bottom:6px; }
+  .unit .a { white-space:pre-wrap; color:#cdd3de; font-size:13px; }
+  .tag { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; background:var(--panel2); color:var(--muted); margin-left:6px; }
+  .tag.review { background:#3a2f18; color:var(--warn); }
+  .tag.err { background:#3a1e1c; color:var(--err); }
+  .keys { margin-top:8px; font-size:12px; color:var(--muted); }
+  .keys code { background:var(--panel2); padding:1px 6px; border-radius:4px; margin:2px 4px 2px 0; display:inline-block; }
+  .filter { display:flex; gap:6px; margin-bottom:12px; }
+  .filter input { flex:1; background:var(--panel2); border:1px solid var(--line); color:var(--fg); border-radius:6px; padding:6px 10px; }
+  .empty { color:var(--muted); text-align:center; margin-top:60px; }
+  .log { font-family:ui-monospace,monospace; font-size:12px; color:var(--muted); background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 10px; margin-bottom:12px; max-height:120px; overflow-y:auto; white-space:pre-wrap; }
+  h2.sec { font-size:13px; color:var(--muted); margin:18px 0 8px; text-transform:uppercase; letter-spacing:.05em; }
+</style>
+</head>
+<body>
+<header>
+  <h1>诊断知识库流水线</h1>
+  <button class="btn primary" id="runAll">▶ 运行全部</button>
+  <button class="btn" id="exportBtn">⬇ 导出 CSV/SOP</button>
+  <div class="spacer"></div>
+  <div class="stats" id="stats"></div>
+</header>
+<div class="wrap">
+  <div class="sidebar">
+    <div id="docs"></div>
+  </div>
+  <div class="main">
+    <div class="log" id="log" style="display:none"></div>
+    <div class="filter">
+      <input id="q" placeholder="过滤问答（输入关键词）…">
+      <span class="stats" style="align-items:center"><span id="viewTitle">全部</span></span>
+    </div>
+    <div id="units"><div class="empty">运行流水线后，这里实时显示每篇文档抽取出的问答与流程。</div></div>
+  </div>
+</div>
+<script>
+const S = { docs:{}, units:{}, sel:null, running:false };
+const $ = s => document.querySelector(s);
+
+function api(path, body){ return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(r=>r.json()); }
+
+function renderStats(){
+  const d = Object.values(S.docs);
+  const done = d.filter(x=>x.status==='done').length;
+  const run = d.filter(x=>x.status==='running').length;
+  const qa = d.reduce((a,x)=>a+(x.passed||0),0);
+  const rev = d.reduce((a,x)=>a+(x.needs_review||0),0);
+  const sop = d.reduce((a,x)=>a+(x.sop_count||0),0);
+  $('#stats').innerHTML = `<span>文档 <b>${done}/${d.length}</b></span>`+
+    (run?`<span>运行中 <b>${run}</b></span>`:'')+
+    `<span>QA <b>${qa}</b></span><span>SOP <b>${sop}</b></span>`+
+    (rev?`<span>待审 <b style="color:var(--warn)">${rev}</b></span>`:'');
+}
+
+function docCard(d){
+  const sel = S.sel===d.topic?' sel':'';
+  const pinLabel = d.pinned?'📌 已固定':'固定';
+  const prog = S.docs[d.topic]._prog;
+  const barHtml = (d.status==='running'&&prog)?`<div class="bar"><i style="width:${Math.round(prog.done/prog.total*100)}%"></i></div>`:'';
+  return `<div class="doc${sel}" data-topic="${d.topic}">
+    <div class="doc-top"><span class="dot s-${d.status}"></span><span class="doc-name">${d.topic}</span></div>
+    <div class="doc-meta"><span>QA ${d.passed||0}</span><span>SOP ${d.sop_count||0}</span>
+      ${d.needs_review?`<span style="color:var(--warn)">待审 ${d.needs_review}</span>`:''}
+      ${d.status==='failed'?`<span style="color:var(--err)">失败</span>`:''}</div>
+    ${barHtml}
+    <div class="doc-actions">
+      <button class="btn" data-act="pin" data-topic="${d.topic}">${pinLabel}</button>
+      <button class="btn" data-act="retry" data-topic="${d.topic}">重试</button>
+    </div></div>`;
+}
+function renderDocs(){
+  const arr = Object.values(S.docs).sort((a,b)=>a.topic.localeCompare(b.topic));
+  $('#docs').innerHTML = arr.map(docCard).join('') || '<div class="empty">未发现文档</div>';
+}
+
+function unitHtml(u){
+  if(u.unit_kind==='sop'){
+    const eqs=(u.entry_questions||[]).map(q=>`<code>${esc(q)}</code>`).join('');
+    return `<div class="unit sop"><div class="q">📋 ${esc(u.title||'')}${u.struct_ok===false?'<span class="tag err">结构异常</span>':''}</div>
+      <div class="keys">入口问题：${eqs}</div></div>`;
+  }
+  const keys=(u.query_keys||[]).slice(1).map(k=>`<code>${esc(k)}</code>`).join('');
+  return `<div class="unit qa"><div class="q">${esc(u.query||'')}
+    ${u.needs_review?'<span class="tag review">待审</span>':''}
+    ${u.truncated?'<span class="tag err">截断</span>':''}</div>
+    <div class="a">${esc(u.answer||'')}</div>
+    ${keys?`<div class="keys">近义键：${keys}</div>`:''}</div>`;
+}
+function renderUnits(){
+  const filter=$('#q').value.trim().toLowerCase();
+  let list=[];
+  const topics = S.sel? [S.sel] : Object.keys(S.units);
+  $('#viewTitle').textContent = S.sel || '全部';
+  topics.forEach(t=>{ (S.units[t]||[]).forEach(u=>list.push(u)); });
+  if(filter) list=list.filter(u=>JSON.stringify(u).toLowerCase().includes(filter));
+  $('#units').innerHTML = list.length? list.map(unitHtml).join('')
+    : '<div class="empty">暂无内容。运行或选择一篇文档。</div>';
+}
+function esc(s){ return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function addLog(msg){ const el=$('#log'); el.style.display='block'; el.textContent=(msg+'\n'+el.textContent).slice(0,4000); }
+
+function onEvent(ev){
+  if(ev.kind==='doc_status'){
+    const t=ev.topic; S.docs[t]=S.docs[t]||{topic:t}; S.docs[t].status=ev.data.status;
+    if(ev.data.status==='pinned') S.docs[t].pinned=true;
+    if(ev.data.status==='unpinned') S.docs[t].pinned=false;
+    renderDocs(); renderStats();
+  } else if(ev.kind==='doc_progress'){
+    const t=ev.topic; if(S.docs[t]){ S.docs[t]._prog={done:ev.data.done,total:ev.data.total}; renderDocs(); }
+  } else if(ev.kind==='unit'){
+    const t=ev.topic; S.units[t]=S.units[t]||[];
+    S.units[t].push(ev.data); renderUnits();
+  } else if(ev.kind==='run_status'){
+    if(ev.data.status==='started'){ S.running=true; $('#runAll').disabled=true; Object.keys(S.units).forEach(k=>delete S.units[k]); }
+    if(ev.data.status==='done'){ S.running=false; $('#runAll').disabled=false; refreshState(); }
+    if(ev.data.status==='exported'){ addLog(`导出完成：QA ${ev.data.qa_units} 单元 / ${ev.data.qa_rows} 行，SOP ${ev.data.sop_files} 篇，待审 ${ev.data.needs_review}`); }
+  } else if(ev.kind==='log'){ addLog(ev.data.message||''); }
+  else if(ev.kind==='error'){ addLog('❌ '+ev.topic+': '+(ev.data.message||'')); }
+}
+
+function refreshState(){
+  fetch('/api/state').then(r=>r.json()).then(d=>{
+    (d.docs||[]).forEach(x=>S.docs[x.topic]=Object.assign(S.docs[x.topic]||{},x));
+    // load persisted QA/SOP into the unit view keyed by topic
+    const res=d.results||{};
+    (res.qa||[]).forEach(u=>{ const t=(u.sources&&u.sources[0]&&u.sources[0].topic)||''; S.units[t]=S.units[t]||[];
+      if(!S.units[t].some(x=>x.query===u.query)) S.units[t].push({unit_kind:'qa',query:u.query,answer:u.answer,query_keys:[u.query,...(u.paraphrases||[])],needs_review:u.needs_review}); });
+    (res.sop||[]).forEach(u=>{ const t=(u.sources&&u.sources[0]&&u.sources[0].topic)||''; S.units[t]=S.units[t]||[];
+      if(!S.units[t].some(x=>x.title===u.title)) S.units[t].push({unit_kind:'sop',title:u.title,entry_questions:u.entry_questions,struct_ok:u.struct_ok}); });
+    renderDocs(); renderStats(); renderUnits();
+  });
+}
+
+// events
+$('#docs').addEventListener('click', e=>{
+  const act=e.target.dataset.act, topic=e.target.dataset.topic;
+  if(act==='pin'){ const cur=S.docs[topic]&&S.docs[topic].pinned; api('/api/pin',{topic,pinned:!cur}); e.stopPropagation(); return; }
+  if(act==='retry'){ api('/api/retry',{topics:[topic]}); e.stopPropagation(); return; }
+  const card=e.target.closest('.doc'); if(card){ S.sel = S.sel===card.dataset.topic?null:card.dataset.topic; renderDocs(); renderUnits(); }
+});
+$('#runAll').onclick=()=>api('/api/run',{});
+$('#exportBtn').onclick=()=>api('/api/export',{});
+$('#q').addEventListener('input', renderUnits);
+
+const es=new EventSource('/api/events');
+es.onmessage=e=>{ try{ onEvent(JSON.parse(e.data)); }catch(_){} };
+refreshState();
+</script>
+</body>
+</html>
