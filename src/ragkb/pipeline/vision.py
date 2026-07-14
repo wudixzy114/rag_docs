@@ -15,10 +15,10 @@ from __future__ import annotations
 import hashlib
 import logging
 
-from ragkb.llm.client import LLMClient, LLMError, VisionImage
+from ragkb.llm.client import LLMClient, LLMError, LLMQuotaError, VisionImage
 from ragkb.parse.model import Document, Image
 from ragkb.pipeline.prompts import VISION_VERSION, VISION_SYSTEM, build_vision_user
-from ragkb.pipeline.scrub import scrub
+from ragkb.pipeline.scrub import mask
 from ragkb.store.cache import Cache, key_for
 
 log = logging.getLogger(__name__)
@@ -61,10 +61,19 @@ def vision_read_image(img: Image, llm: LLMClient, cache: Cache,
     try:
         r = llm.complete_vision(
             system=VISION_SYSTEM,
-            user=build_vision_user(scrub(img.inline_ocr)),
+            user=build_vision_user(mask(img.inline_ocr)),
             images=[vi], max_tokens=_VISION_MAX_TOKENS, task="vision", model=model)
+    except LLMQuotaError as exc:
+        # Every vision-capable model is quota-exhausted. Do NOT fabricate and do
+        # NOT fall back to a text model — record the image as unread so the
+        # orchestrator can retry later. Not cached (transient).
+        log.warning("vision quota exhausted for %s; leaving unread", img.rel_path)
+        img.vision_failed = True
+        return {"transcript": "", "meaning": "", "model": "", "truncated": False,
+                "error": "vision_quota_exhausted"}
     except LLMError as exc:
         log.warning("vision read failed for %s: %s", img.rel_path, exc)
+        img.vision_failed = True
         return {"transcript": "", "meaning": "", "model": "", "truncated": False,
                 "error": str(exc)}
 

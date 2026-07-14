@@ -1,51 +1,107 @@
-"""Sensitive-content scrubbing — applied BEFORE sending to the gateway.
+"""Reversible sensitive-content masking.
 
-Two reasons this runs pre-send, not just at export:
-1. The gateway's content-safety filter hard-rejects (400 FAILED_PRECONDITION) any
-   request containing MAC addresses / internal IPs / credential tokens. Scrubbing
-   first is what lets those sections be processed at all.
-2. A diagnostic KB should never surface internal MAC/IP/keys to end users anyway,
-   so redacting at the source keeps every downstream artifact clean.
+The gateway's content-safety filter hard-rejects (400 FAILED_PRECONDITION) any
+request containing MAC addresses / internal IPs / phone numbers / credential
+tokens. So we MUST mask before sending. But the knowledge base is used INTERNALLY
+(company chat groups) where these values should be visible — so masking must be
+REVERSIBLE: mask for the gateway, restore on export.
 
-We redact credential-shaped and machine-identifier tokens, but deliberately KEEP
-internal hostnames/URLs (e.g. storage.jd.local upgrade scripts) — those are often
-the legitimate, actionable content of an answer.
+Mechanism:
+- Each sensitive value → a deterministic placeholder `〔KIND:hash〕` where hash is
+  derived from the value. Same value always maps to the same token, so caching,
+  dedup and cross-file aggregation are unaffected (the masked text is stable).
+- The Redactor records value↔token both ways. `restore()` swaps tokens back to
+  the real values on export. The map is also persisted (redaction_map.json) as an
+  audit trail.
+- Uses full-width brackets 〔〕 and a hex suffix so a placeholder never collides
+  with real content and survives round-tripping through the model verbatim.
 
-Placeholders are human-readable ([MAC]/[IP]/[REDACTED]) so a reader still sees
-that a value was there, and diagnostic meaning ("检查网卡 MAC") survives.
+User decision (2026-07-14): restore EVERYTHING internally, incl. credentials — no
+denylist. If that ever changes, `restore()` is the single choke point to gate.
 """
 from __future__ import annotations
 
+import hashlib
 import re
+import threading
 
-# MAC address: six hex pairs separated by : or - (e.g. a2:16:80:bb:aa:2b).
-_MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
-# IPv6-ish link-local fragments the gateway also flags (e.g. fe80::ecee:eeff:feee).
-_IPV6_RE = re.compile(r"\bfe80::[0-9A-Fa-f:]{4,}\b")
-# Private IPv4 ranges (10./172.16-31./192.168.). Public IPs are left alone — they
-# are rarely sensitive and sometimes part of a legitimate example.
-_PRIV_IP_RE = re.compile(
-    r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
-    r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
-    r"|192\.168\.\d{1,3}\.\d{1,3})\b")
-# Credential-shaped tokens.
-_CREDS = [
-    re.compile(r"(?i)(authorization:\s*bearer\s+)[A-Za-z0-9._\-]+"),
-    re.compile(r"(?i)\b(api[_-]?key\s*[=:]\s*)[A-Za-z0-9._\-]{12,}"),
-    re.compile(r"(?i)\b(token\s*[=:]\s*)[A-Za-z0-9._\-]{16,}"),
-    re.compile(r"\b[0-9a-f]{32}\b"),                 # bare 32-hex (gateway key shape)
+# Detection patterns, each tagged with a KIND label used in the placeholder.
+_PATTERNS = [
+    ("MAC", re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")),
+    ("IPV6", re.compile(r"\bfe80::[0-9A-Fa-f:]{2,}\b")),
+    ("IP", re.compile(
+        r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+        r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+        r"|192\.168\.\d{1,3}\.\d{1,3})\b")),
+    ("PHONE", re.compile(r"\b1[3-9]\d{9}\b")),          # CN mobile numbers
+    ("BEARER", re.compile(r"(?i)(?<=bearer )[A-Za-z0-9._\-]{8,}")),
+    ("KEY", re.compile(r"(?i)(?<=api[_-]key[=: ])[A-Za-z0-9._\-]{12,}")),
+    ("HEX32", re.compile(r"\b[0-9a-f]{32}\b")),          # gateway-key-shaped tokens
 ]
 
 
-def scrub(text: str) -> str:
-    """Redact MAC/private-IP/credential tokens; keep hostnames and public content."""
-    s = text or ""
-    s = _MAC_RE.sub("[MAC]", s)
-    s = _IPV6_RE.sub("[IPv6]", s)
-    s = _PRIV_IP_RE.sub("[IP]", s)
-    for pat in _CREDS:
-        if pat.groups:
-            s = pat.sub(lambda m: m.group(1) + "[REDACTED]", s)
-        else:
-            s = pat.sub("[REDACTED]", s)
-    return s
+class Redactor:
+    """Stateful, reversible masker. One instance per run; thread-safe so parallel
+    doc workers share a single value↔token map (a value seen in two docs gets the
+    same token, keeping cross-file dedup stable)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._to_token: dict[str, str] = {}
+        self._to_value: dict[str, str] = {}
+
+    def _token(self, kind: str, value: str) -> str:
+        h = hashlib.sha256(value.encode("utf-8")).hexdigest()[:6]
+        return f"〔{kind}:{h}〕"
+
+    def mask(self, text: str) -> str:
+        """Replace every sensitive value with its deterministic placeholder,
+        recording the mapping. Idempotent: masking already-masked text is a no-op
+        (placeholders don't match the patterns)."""
+        if not text:
+            return text
+        s = text
+        for kind, pat in _PATTERNS:
+            def _sub(m: re.Match) -> str:
+                val = m.group(0)
+                tok = self._token(kind, val)
+                with self._lock:
+                    self._to_token[val] = tok
+                    self._to_value[tok] = val
+                return tok
+            s = pat.sub(_sub, s)
+        return s
+
+    def restore(self, text: str) -> str:
+        """Swap every known placeholder back to its real value (export path)."""
+        if not text:
+            return text
+        s = text
+        with self._lock:
+            items = list(self._to_value.items())
+        for tok, val in items:
+            if tok in s:
+                s = s.replace(tok, val)
+        return s
+
+    def mapping(self) -> dict[str, str]:
+        """token → real value, for the audit sidecar (redaction_map.json)."""
+        with self._lock:
+            return dict(self._to_value)
+
+
+# A process-wide default redactor so the mask (extract/vision) and restore
+# (export) paths share one map without threading it through every call.
+_DEFAULT = Redactor()
+
+
+def mask(text: str) -> str:
+    return _DEFAULT.mask(text)
+
+
+def restore(text: str) -> str:
+    return _DEFAULT.restore(text)
+
+
+def mapping() -> dict[str, str]:
+    return _DEFAULT.mapping()

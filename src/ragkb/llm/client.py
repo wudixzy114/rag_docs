@@ -283,32 +283,29 @@ class LLMClient:
         SAME call degrades correctly as the fallback chain advances.
 
         Quality-first: this is how the pipeline reads source screenshots — the
-        model's own vision is far more faithful than the pre-baked OCR, so image
-        content is always sent to a vision-capable model. Keep the chain (or an
-        explicit `model`/`task`) pointed at vision models; a text-only fallback
-        would see the text prompt but silently lose the images."""
-        chain = [model] if model else self.settings.chain_for(task)
+        model's own vision is far more faithful than the pre-baked OCR. The
+        fallback chain is the VISION-ONLY chain (settings.vision_chain): it
+        contains vision-capable (Claude) models exclusively, so a quota fallback
+        can never land on a text-only model that would silently drop the image.
+        If every vision model is quota-exhausted, this raises LLMQuotaError — the
+        caller records the image as unread rather than trusting a fabricated
+        transcription."""
+        chain = [model] if model else self.settings.vision_chain()
 
         def _once() -> LLMResult:
-            if self._active_is_anthropic():
-                content = [img.to_anthropic_block() for img in images]
-                content.append({"type": "text", "text": user})
-                return self._anthropic_messages(
-                    system=system,
-                    messages=[{"role": "user", "content": content}],
-                    tools=None, temperature=temperature, max_tokens=max_tokens)
-            content = [img.to_openai_block() for img in images]
+            if not self._active_is_anthropic():
+                # Defensive: the vision chain is all-anthropic by construction, so
+                # this only fires if a caller forced a text-only `model=`. Refuse
+                # rather than send an image a text model will ignore.
+                raise LLMError(
+                    f"model {self._active_model()} is not vision-capable; "
+                    "refusing to send image content")
+            content = [img.to_anthropic_block() for img in images]
             content.append({"type": "text", "text": user})
-            payload = {
-                "model": self._active_model(),
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": content},
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-            return self._post_chat(payload)
+            return self._anthropic_messages(
+                system=system,
+                messages=[{"role": "user", "content": content}],
+                tools=None, temperature=temperature, max_tokens=max_tokens)
 
         return self._with_model_fallback(chain, _once)
 

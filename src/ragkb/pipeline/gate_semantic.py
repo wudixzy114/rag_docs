@@ -19,9 +19,8 @@ Design, lifted from magnus-lens verify.py:
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
-from ragkb.llm.client import LLMClient, LLMError
+from ragkb.llm.client import LLMClient, LLMError, LLMQuotaError
 from ragkb.pipeline.jsonutil import parse_json_array
 from ragkb.pipeline.prompts import REVIEW_SYSTEM, build_review_user
 from ragkb.pipeline.units import QAUnit
@@ -29,7 +28,6 @@ from ragkb.pipeline.units import QAUnit
 log = logging.getLogger(__name__)
 
 _REVIEW_BATCH = 25
-_REVIEW_CONCURRENCY = 4
 _REVIEW_MAX_TOKENS = 2048
 
 
@@ -44,12 +42,8 @@ def _source_text(unit: QAUnit) -> str:
 def _run_batch(chunk: list[QAUnit], llm: LLMClient) -> dict[int, tuple[str, str]]:
     items = [{"id": i, "query": u.query, "answer": u.answer,
               "source": _source_text(u)} for i, u in enumerate(chunk)]
-    try:
-        r = llm.complete(system=REVIEW_SYSTEM, user=build_review_user(items),
-                         max_tokens=_REVIEW_MAX_TOKENS, task="review")
-    except LLMError as exc:
-        log.warning("review batch failed (%d items): %s", len(chunk), exc)
-        return {}
+    r = llm.complete(system=REVIEW_SYSTEM, user=build_review_user(items),
+                     max_tokens=_REVIEW_MAX_TOKENS, task="review")
     return _parse_verdicts(r.text)
 
 
@@ -72,23 +66,39 @@ def _parse_verdicts(text: str) -> dict[int, tuple[str, str]]:
 
 def review_qa(units: list[QAUnit], llm: LLMClient,
               policy: str = "fail_closed") -> list[QAUnit]:
-    """Review every unit; annotate semantic_ok / semantic_reason / needs_review.
-    Returns the same list (mutated). A "revise" verdict passes but is flagged for
-    human review; "reject" fails; a missing verdict is fail-closed per policy."""
+    """Review every unit with the strong model (task='review' → Opus-4.8: generate
+    first, review second, same top model). Annotates semantic_ok / semantic_reason
+    / needs_review.
+
+    Quota-aware (user's rule "审核没余额就不跑了"): if the reviewer model's quota is
+    exhausted, we DON'T fail-closed-drop everything and we DON'T burn the run —
+    we SKIP review, keep every struct-ok unit, and flag them needs_review so a
+    human can check later. Losing the review pass must not lose the extraction.
+
+    Batches run SERIALLY (no internal thread pool): review already runs once after
+    the per-doc pool has closed, and serial batches keep gateway pressure low so
+    one shared quota isn't hammered by nested concurrency.
+    """
     if not units:
         return units
     chunks = [units[i:i + _REVIEW_BATCH] for i in range(0, len(units), _REVIEW_BATCH)]
 
-    def run(chunk):
-        return chunk, _run_batch(chunk, llm)
-
     results = []
-    if len(chunks) == 1:
-        results.append(run(chunks[0]))
-    else:
-        workers = min(_REVIEW_CONCURRENCY, len(chunks))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(run, chunks))
+    for chunk in chunks:
+        try:
+            verdicts = _run_batch(chunk, llm)
+        except LLMQuotaError:
+            # Reviewer out of quota — stop reviewing entirely. Keep everything
+            # already-and-not-yet reviewed, flagged for human review.
+            log.warning("reviewer quota exhausted; skipping semantic review for "
+                        "remaining %d units (kept, flagged needs_review)",
+                        sum(len(c) for c in chunks[chunks.index(chunk):]))
+            _mark_skipped(units)
+            return units
+        except LLMError as exc:
+            log.warning("review batch failed (%d items): %s", len(chunk), exc)
+            verdicts = {}
+        results.append((chunk, verdicts))
 
     for chunk, verdicts in results:
         for i, u in enumerate(chunk):
@@ -112,3 +122,14 @@ def review_qa(units: list[QAUnit], llm: LLMClient,
             else:  # reject
                 u.semantic_ok = False
     return units
+
+
+def _mark_skipped(units: list[QAUnit]) -> None:
+    """Reviewer unavailable: keep every unit that hasn't already been rejected,
+    flag it for human review. Units already reviewed this run keep their verdict."""
+    for u in units:
+        if u.semantic_ok is None:
+            u.semantic_ok = True
+            u.needs_review = True
+            u.semantic_reason = "review_skipped:no_quota"
+

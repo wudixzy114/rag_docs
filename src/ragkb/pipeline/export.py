@@ -1,18 +1,22 @@
 """Export layer — produce the vector-DB ingest artifacts.
 
-Three outputs into output/:
-- `qa_pairs.csv`: STRICT two columns `Query,Answer`. One row per query key (main
+Outputs into output/:
+- `qa_pairs.csv`: three columns `Query,Answer,Module`. One row per query key (main
   query + every paraphrase → same answer), so the recall boost materializes as
-  extra rows. csv.QUOTE_ALL + utf-8-sig so CJK / commas / newlines never misalign
-  and Excel opens it correctly.
-- `sop/<topic>__<title>.md`: one cleaned procedure per file, with its entry
-  questions embedded at the top (as front-matter-ish bullets) so the vector DB
-  chunker sees the symptom phrasings alongside the procedure body.
-- `metadata.jsonl`: one line per QA unit with provenance (topic/doc/heading/
-  source_sha/sources). NEVER merged into the CSV — it's the traceability sidecar.
+  extra rows. `Module` is a SOFT label — the vector DB indexes globally and may
+  use it to filter/boost when the caller's module is known, but retrieval is NOT
+  hard-partitioned (a symptom query must reach every module). QUOTE_ALL +
+  utf-8-sig so CJK / commas / newlines never misalign.
+- `by_module/<module>/qa_pairs.csv` + `by_module/<module>/sop/`: the same content
+  partitioned per module, for callers that ingest one module at a time. Dedup is
+  module-scoped upstream, so each module's file is self-contained.
+- `sop/<module>__<title>.md`: global SOP dir (all procedures).
+- `metadata.jsonl`: provenance sidecar (never in the CSV).
+- `redaction_map.json`: token→real-value audit trail for the reversible masking.
 
-Secret scrub: internal tokens / bearer keys are regex-stripped from all exported
-text before it lands in a queryable store.
+Reversible masking: text was masked (MAC/IP/phone/keys → placeholders) BEFORE
+being sent to the gateway. On export we RESTORE the real values — the KB is
+internal, so everything is visible. `restore()` is the single choke point.
 """
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from ragkb.pipeline.scrub import scrub
+from ragkb.pipeline.scrub import mapping, restore
 from ragkb.pipeline.units import QAUnit, SOPUnit
 
 
@@ -32,11 +36,45 @@ class ExportStats:
     qa_rows: int = 0
     sop_files: int = 0
     needs_review: int = 0
+    modules: int = 0
 
 
 def _safe_filename(s: str) -> str:
     s = re.sub(r"[^\w一-鿿.-]+", "_", s).strip("_")
     return s[:80] or "untitled"
+
+
+def _module_of(u) -> str:
+    return u.sources[0].topic if u.sources else "_unknown"
+
+
+def _write_qa_csv(path: Path, units: list[QAUnit]) -> int:
+    """Write a Query,Answer,Module CSV. Returns row count. Values are RESTORED
+    (real MAC/IP/etc.) since the KB is internal."""
+    rows = 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(["Query", "Answer", "Module"])
+        for u in units:
+            ans = restore(u.answer)
+            mod = _module_of(u)
+            for key in u.query_keys():
+                w.writerow([restore(key), ans, mod])
+                rows += 1
+    return rows
+
+
+def _write_sop(sop_dir: Path, units: list[SOPUnit]) -> int:
+    sop_dir.mkdir(parents=True, exist_ok=True)
+    for u in units:
+        topic = _module_of(u)
+        fname = f"{_safe_filename(topic)}__{_safe_filename(u.title)}.md"
+        eqs = "\n".join(f"- {restore(q)}" for q in u.entry_questions)
+        header = (f"<!-- entry-questions (用户口吻入口问题，供检索路由) -->\n{eqs}\n\n"
+                  if eqs else "")
+        (sop_dir / fname).write_text(header + restore(u.markdown) + "\n", "utf-8")
+    return len(units)
 
 
 def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
@@ -45,45 +83,48 @@ def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
     output_dir.mkdir(parents=True, exist_ok=True)
     stats = ExportStats()
 
-    # 1. qa_pairs.csv — strict two columns, one row per query key.
-    csv_path = output_dir / "qa_pairs.csv"
-    with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f, quoting=csv.QUOTE_ALL)
-        w.writerow(["Query", "Answer"])
-        for u in qa_units:
-            ans = scrub(u.answer)
-            for key in u.query_keys():
-                w.writerow([scrub(key), ans])
-                stats.qa_rows += 1
-            stats.qa_units += 1
-            if u.needs_review:
-                stats.needs_review += 1
+    # 1. Global qa_pairs.csv (all modules, with Module column).
+    stats.qa_rows = _write_qa_csv(output_dir / "qa_pairs.csv", qa_units)
+    stats.qa_units = len(qa_units)
+    stats.needs_review = sum(1 for u in qa_units if u.needs_review)
 
-    # 2. sop/*.md — one procedure per file, entry questions at the top.
-    sop_dir = output_dir / "sop"
-    sop_dir.mkdir(exist_ok=True)
+    # 2. Global sop/ dir.
+    stats.sop_files = _write_sop(output_dir / "sop", sop_units)
+
+    # 3. Per-module partition: by_module/<module>/{qa_pairs.csv, sop/}.
+    modules: dict[str, dict] = {}
+    for u in qa_units:
+        modules.setdefault(_module_of(u), {"qa": [], "sop": []})["qa"].append(u)
     for u in sop_units:
-        topic = u.sources[0].topic if u.sources else ""
-        fname = f"{_safe_filename(topic)}__{_safe_filename(u.title)}.md"
-        eqs = "\n".join(f"- {scrub(q)}" for q in u.entry_questions)
-        header = (f"<!-- entry-questions (用户口吻入口问题，供检索路由) -->\n{eqs}\n\n"
-                  if eqs else "")
-        (sop_dir / fname).write_text(header + scrub(u.markdown) + "\n", "utf-8")
-        stats.sop_files += 1
+        modules.setdefault(_module_of(u), {"qa": [], "sop": []})["sop"].append(u)
+    by_module = output_dir / "by_module"
+    for mod, bucket in modules.items():
+        mdir = by_module / _safe_filename(mod)
+        if bucket["qa"]:
+            _write_qa_csv(mdir / "qa_pairs.csv", bucket["qa"])
+        if bucket["sop"]:
+            _write_sop(mdir / "sop", bucket["sop"])
+    stats.modules = len(modules)
 
-    # 3. metadata.jsonl — provenance sidecar (never in the CSV).
-    meta_path = output_dir / "metadata.jsonl"
-    with meta_path.open("w", encoding="utf-8") as f:
+    # 4. metadata.jsonl — provenance sidecar (restored values, module label).
+    with (output_dir / "metadata.jsonl").open("w", encoding="utf-8") as f:
         for u in qa_units:
             rec = {
                 "unit_id": u.unit_id,
-                "query": u.query,
-                "query_keys": u.query_keys(),
-                "answer": scrub(u.answer),
+                "module": _module_of(u),
+                "query": restore(u.query),
+                "query_keys": [restore(k) for k in u.query_keys()],
+                "answer": restore(u.answer),
                 "needs_review": u.needs_review,
                 "semantic_reason": u.semantic_reason,
                 "sources": [s.to_dict() for s in u.sources],
             }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    # 5. redaction_map.json — audit trail of every masked value (token → real).
+    audit = mapping()
+    if audit:
+        (output_dir / "redaction_map.json").write_text(
+            json.dumps(audit, ensure_ascii=False, indent=2), "utf-8")
 
     return stats

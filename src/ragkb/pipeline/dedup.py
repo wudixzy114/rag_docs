@@ -45,8 +45,8 @@ def _merge(keep: QAUnit, drop: QAUnit) -> QAUnit:
     return keep
 
 
-def dedup_qa(units: list[QAUnit], threshold: float = _DEFAULT_THRESHOLD) -> list[QAUnit]:
-    """Collapse exact + near-duplicate QA units. Order-stable on first occurrence."""
+def _dedup_within(units: list[QAUnit], threshold: float) -> list[QAUnit]:
+    """Collapse exact + near-duplicate QA within one group. Order-stable."""
     kept: list[QAUnit] = []
     norms: list[str] = []
     exact: dict[str, int] = {}
@@ -55,7 +55,6 @@ def dedup_qa(units: list[QAUnit], threshold: float = _DEFAULT_THRESHOLD) -> list
         if nq and nq in exact:
             _merge(kept[exact[nq]], u)
             continue
-        # near-dup scan against already-kept norms
         hit = -1
         for idx, kn in enumerate(norms):
             if kn and fuzz.token_set_ratio(nq, kn) >= threshold:
@@ -68,3 +67,25 @@ def dedup_qa(units: list[QAUnit], threshold: float = _DEFAULT_THRESHOLD) -> list
         kept.append(u)
         norms.append(nq)
     return kept
+
+
+def dedup_qa(units: list[QAUnit], threshold: float = _DEFAULT_THRESHOLD) -> list[QAUnit]:
+    """Collapse duplicates MODULE-SCOPED: dedup only within the same module
+    (source topic), never across modules. Rationale (user's recall-first rule):
+    the same question in 9N-LLM vs 9N-Tritium may have module-specific answers
+    (different mirror source, command); merging across modules would drop a
+    module's distinct answer and hurt that module's recall. Cross-module dupes are
+    intentionally kept, each tagged with its own module. Order-stable by module
+    first-seen, then within module."""
+    by_module: dict[str, list[QAUnit]] = {}
+    order: list[str] = []
+    for u in units:
+        mod = u.sources[0].topic if u.sources else ""
+        if mod not in by_module:
+            by_module[mod] = []
+            order.append(mod)
+        by_module[mod].append(u)
+    out: list[QAUnit] = []
+    for mod in order:
+        out.extend(_dedup_within(by_module[mod], threshold))
+    return out

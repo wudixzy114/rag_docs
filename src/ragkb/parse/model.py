@@ -29,6 +29,7 @@ class Image:
     inline_ocr: str = ""          # pre-baked OCR — LOW confidence, hint only
     vision_text: str = ""         # authoritative transcription (filled by vision layer)
     exists: bool = True           # abs_path resolved to a real file
+    vision_failed: bool = False   # vision read failed (quota/error) — image left unread
 
     @property
     def best_text(self) -> str:

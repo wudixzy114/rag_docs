@@ -138,6 +138,11 @@ class LLMSettings(BaseSettings):
     # A task not listed here uses `model`. Tasks: classify|extract|sop|
     # paraphrase|review|aggregate.
     task_models_raw: str = Field(default="", alias="JD_LLM_TASK_MODELS")
+    # Vision-capable models ONLY, comma-separated. The vision fallback chain is
+    # drawn from HERE, never from the general chain — a text-only model (e.g.
+    # DeepSeek) would silently drop images and hallucinate a transcription. Empty
+    # => derive from the general chain by keeping only Claude (anthropic) models.
+    vision_models_raw: str = Field(default="", alias="JD_LLM_VISION_MODELS")
     timeout_seconds: float = Field(default=90.0, alias="JD_LLM_TIMEOUT")
     max_retries: int = Field(default=3, alias="JD_LLM_MAX_RETRIES")
 
@@ -261,6 +266,24 @@ class LLMSettings(BaseSettings):
             if m not in chain:
                 chain.append(m)
         return chain
+
+    def vision_chain(self) -> list[str]:
+        """Fallback chain for VISION calls — vision-capable models ONLY. Drawn
+        from JD_LLM_VISION_MODELS if set, else the general chain filtered to
+        Claude (anthropic) models. Never includes a text-only model, so a
+        multimodal call can't silently degrade to one that drops the image."""
+        raw = (self.vision_models_raw or "").strip()
+        if raw:
+            models = [m.strip() for m in raw.split(",") if m.strip()]
+        else:
+            models = [m for m in self.fallback_chain if self.model_is_anthropic(m)]
+        # Keep only genuinely vision-capable (Claude) models, de-duped, order-stable.
+        seen, out = set(), []
+        for m in models:
+            if self.model_is_anthropic(m) and m not in seen:
+                seen.add(m)
+                out.append(m)
+        return out or [self.model]
 
 
 @lru_cache

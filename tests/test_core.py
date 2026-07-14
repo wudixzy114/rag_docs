@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ragkb.parse.markdown import parse_document
 from ragkb.pipeline.dedup import dedup_qa
-from ragkb.pipeline.export import export_all, scrub
+from ragkb.pipeline.export import export_all
 from ragkb.pipeline.gate_struct import gate_qa, gate_sop
 from ragkb.pipeline.units import Provenance, QAUnit, SOPUnit
 
@@ -66,41 +66,77 @@ def test_sop_gate_requires_entry_questions():
 
 
 def test_dedup_merges_and_unions_keys():
-    a = QAUnit(query="任务OOM怎么办", answer="加内存")
-    b = QAUnit(query="任务 OOM 怎么办？", answer="加内存")   # near-dup query
+    a = QAUnit(query="任务OOM怎么办", answer="加内存", sources=[Provenance(topic="t")])
+    b = QAUnit(query="任务 OOM 怎么办？", answer="加内存",   # near-dup query, same module
+               sources=[Provenance(topic="t")])
     b.paraphrases = ["内存爆了咋整"]
     kept = dedup_qa([a, b])
     assert len(kept) == 1
     assert "内存爆了咋整" in kept[0].query_keys()          # dropped unit's key preserved
 
 
-def test_export_csv_two_columns_quote_all(tmp_path):
+def test_dedup_is_module_scoped():
+    """Same question in two modules must NOT merge — each module keeps its own."""
+    a = QAUnit(query="clone没权限怎么办", answer="配置SSH密钥(LLM版)",
+               sources=[Provenance(topic="09_9N-LLM")])
+    b = QAUnit(query="clone没权限怎么办", answer="配置SSH密钥(Tritium版)",
+               sources=[Provenance(topic="10_9N-Tritium")])
+    kept = dedup_qa([a, b])
+    assert len(kept) == 2                                 # cross-module dupes kept
+
+
+def test_export_csv_three_columns_with_module(tmp_path):
     u = QAUnit(query="含,逗号和\n换行的问题", answer='答案含"引号"和,逗号',
-               sources=[Provenance(topic="t")])
+               sources=[Provenance(topic="05_9Nctl常见问题汇总")])
     u.paraphrases = ["另一个问法"]
     stats = export_all([u], [], tmp_path)
     import csv
     rows = list(csv.reader(open(tmp_path / "qa_pairs.csv", encoding="utf-8-sig")))
-    assert rows[0] == ["Query", "Answer"]
-    assert all(len(r) == 2 for r in rows)                 # never misaligned
+    assert rows[0] == ["Query", "Answer", "Module"]
+    assert all(len(r) == 3 for r in rows)                 # never misaligned
     assert stats.qa_rows == 2                             # main query + 1 paraphrase
-    assert not any((not r[0].strip() or not r[1].strip()) for r in rows[1:])
+    assert all(r[2] == "05_9Nctl常见问题汇总" for r in rows[1:])   # module column filled
+    # per-module partition written too
+    assert (tmp_path / "by_module" / "05_9Nctl常见问题汇总" / "qa_pairs.csv").is_file()
 
 
-def test_scrub_redacts_secrets_but_keeps_hostnames():
-    assert "[REDACTED]" in scrub("Authorization: Bearer abc123def456")
-    assert "[REDACTED]" in scrub("9de5dee757784f6abc44a43c93c11d20")   # 32-hex key
-    assert "storage.jd.local" in scrub("wget http://storage.jd.local/x.sh")  # host kept
+def test_reversible_mask_restore():
+    from ragkb.pipeline.scrub import Redactor
+    r = Redactor()
+    orig = "网卡 MAC a2:16:80:bb:aa:2b, 内网 10.20.30.40, 手机 13021946001, key 9de5dee757784f6abc44a43c93c11d20"
+    masked = r.mask(orig)
+    # masked form must NOT contain the raw sensitive values (so it passes the gateway)
+    assert "a2:16:80:bb:aa:2b" not in masked
+    assert "10.20.30.40" not in masked
+    assert "13021946001" not in masked
+    # deterministic: same value → same token across calls
+    assert r.mask("a2:16:80:bb:aa:2b") == r.mask("a2:16:80:bb:aa:2b")
+    # restore round-trips back to the exact original (internal KB shows real values)
+    assert r.restore(masked) == orig
 
 
-def test_scrub_redacts_mac_and_private_ip():
-    """The gateway content-filter 400s on these; pre-scrub must remove them."""
-    s = scrub("网卡 MAC a2:16:80:bb:aa:2b, 内网 10.20.30.40 与 192.168.1.1, 链路 fe80::ecee:eeff:feee:eeee")
-    assert "a2:16:80:bb:aa:2b" not in s and "[MAC]" in s
+def test_mask_is_stable_for_dedup():
+    """Same value must map to the same token so masked text stays dedup-stable."""
+    from ragkb.pipeline.scrub import Redactor
+    r = Redactor()
+    a = r.mask("连接 10.1.2.3 失败")
+    b = r.mask("连接 10.1.2.3 超时")
+    # the IP placeholder is identical in both
+    tok = a.replace("连接 ", "").replace(" 失败", "")
+    assert tok in b
+
+
+def test_mask_covers_mac_ip_phone():
+    """The gateway content-filter 400s on these; pre-send mask must remove them."""
+    from ragkb.pipeline.scrub import Redactor
+    r = Redactor()
+    s = r.mask("网卡 a2:16:80:bb:aa:2b, 内网 10.20.30.40 与 192.168.1.1, 手机 13021946001, 链路 fe80::ecee:eeff:feee")
+    assert "a2:16:80:bb:aa:2b" not in s
     assert "10.20.30.40" not in s and "192.168.1.1" not in s
+    assert "13021946001" not in s
     assert "fe80::ecee" not in s
-    # A public IP is NOT scrubbed (sometimes legitimate example content).
-    assert "8.8.8.8" in scrub("dns 8.8.8.8")
+    # A public IP is NOT masked (sometimes legitimate example content).
+    assert "8.8.8.8" in r.mask("dns 8.8.8.8")
 
 
 def test_content_blocked_detector():
