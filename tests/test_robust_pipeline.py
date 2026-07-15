@@ -18,6 +18,7 @@ from ragkb.pipeline.regenerate import review_with_regeneration
 from ragkb.pipeline.orchestrator import discover_topics
 from ragkb.pipeline.sections import split_oversize_sections
 from ragkb.pipeline.units import Provenance, QAUnit
+from ragkb.server.app import _public_results
 
 
 def test_headerless_document_is_not_dropped(tmp_path):
@@ -224,3 +225,12 @@ def test_llm_client_enforces_global_concurrency_limit():
                       range(8)))
     assert client.peak == 2
     assert client.total_usage.calls == 8
+
+
+def test_public_state_strips_source_evidence_but_keeps_review_status():
+    data = {"qa": [{"query": "q", "publication_status": "failed_review",
+                    "sources": [{"topic": "t", "source_excerpt": "large evidence"}]}],
+            "sop": []}
+    public = _public_results(data)
+    assert public["qa"][0]["publication_status"] == "failed_review"
+    assert public["qa"][0]["sources"] == [{"topic": "t"}]

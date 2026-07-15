@@ -5,7 +5,7 @@ Runs the whole flow and is the single entry point the CLI and the dashboard call
   discover topics
     → per-doc (ThreadPoolExecutor, bounded by settings.max_workers):
         parse → vision-read images → classify sections → extract QA/SOP
-              → Layer1 struct gate → Layer2 semantic gate → paraphrase
+              → Layer1 struct gate → Layer2 semantic gate → one bounded regeneration
     → cross-doc aggregate (by topic) → global dedup
     → store results in memory + on disk (results.json), ready for export/pin
 
@@ -35,7 +35,6 @@ from ragkb.pipeline.classify import classify_sections
 from ragkb.pipeline.dedup import dedup_qa
 from ragkb.pipeline.events import EventBus
 from ragkb.pipeline.extract import extract_qa, extract_qa_sections, extract_sop
-from ragkb.pipeline.gate_semantic import review_qa
 from ragkb.pipeline.gate_struct import gate_qa, gate_sop
 from ragkb.pipeline.paraphrase import add_paraphrases_batch
 from ragkb.pipeline.regenerate import review_with_regeneration

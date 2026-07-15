@@ -23,7 +23,6 @@ from dataclasses import dataclass
 
 from ragkb.llm.client import LLMClient, LLMError, LLMQuotaError
 from ragkb.pipeline.batching import pack_by_size
-from ragkb.pipeline.gate_struct import gate_qa
 from ragkb.pipeline.jsonutil import parse_json_array
 from ragkb.pipeline.prompts import REVIEW_SYSTEM, build_review_user
 from ragkb.pipeline.units import QAUnit
@@ -39,8 +38,6 @@ _REVIEW_MAX_TOKENS = 4096
 class _Verdict:
     verdict: str
     reason: str
-    revised_answer: str = ""
-    revised_query: str = ""
     valid_paraphrases: list[str] | None = None
 
 
@@ -81,8 +78,6 @@ def _parse_verdicts(text: str) -> dict[int, _Verdict]:
         valid = [str(v).strip() for v in valid if str(v).strip()] if isinstance(valid, list) else None
         out[idx] = _Verdict(
             verdict=verdict, reason=str(el.get("reason", "")),
-            revised_answer=str(el.get("revised_answer", "")).strip(),
-            revised_query=str(el.get("revised_query", "")).strip(),
             valid_paraphrases=valid)
     return out
 

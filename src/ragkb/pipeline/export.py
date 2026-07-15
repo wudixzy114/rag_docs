@@ -1,15 +1,10 @@
 """Export layer — produce the vector-DB ingest artifacts.
 
 Outputs into output/:
-- `qa_pairs.csv`: three columns `Query,Answer,Module`. By DEFAULT one row per query
-  key (main query + every paraphrase → same answer), so the recall boost
-  materializes as extra rows. Pass `include_paraphrases=False` to emit the SLIM
-  variant instead — one row per QA unit (main query only), for the internal vector
-  DB which does NOT dedup by answer at retrieval time (there, paraphrase rows would
-  let several near-identical keys for the same answer co-occupy the top-k and crowd
-  out other answers; measured ~5x row inflation). The slim run writes to a SEPARATE
-  file `qa_pairs_no_paraphrase.csv` (+ its own zip) so the default inflated
-  artifacts are never clobbered. Paraphrases always stay in metadata.jsonl. `Module`
+- `qa_pairs.csv`: three columns `Query,Answer,Module`, one source-faithful primary
+  query per approved unit. An explicit expansion experiment writes to separate
+  `qa_pairs_with_paraphrase.csv` and zip artifacts. Failed-review candidates never
+  enter either CSV. `Module`
   is a SOFT label — the vector DB indexes globally and may use it to filter/boost
   when the caller's module is known, but retrieval is NOT hard-partitioned (a
   symptom query must reach every module). QUOTE_ALL + utf-8-sig so CJK / commas /
@@ -146,6 +141,8 @@ def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
                output_dir: Path, include_paraphrases: bool = False) -> ExportStats:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    qa_units = [u for u in qa_units
+                if u.publication_status != "failed_review" and u.semantic_ok is not False]
     stats = ExportStats()
 
     # Source-faithful output is the primary artifact. The opt-in expanded variant
@@ -178,7 +175,7 @@ def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
     stats.modules = len(modules)
 
     # 4. metadata.jsonl — provenance sidecar (restored values, module label).
-    #    Paraphrases are ALWAYS kept here regardless of the CSV variant.
+    #    Only approved/publishable units reach this layer.
     with (output_dir / "metadata.jsonl").open("w", encoding="utf-8") as f:
         for u in qa_units:
             rec = {

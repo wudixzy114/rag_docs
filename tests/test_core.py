@@ -208,6 +208,17 @@ def test_export_removes_stale_generated_sop(tmp_path):
     assert not stale.exists()
 
 
+def test_export_never_publishes_failed_review_units(tmp_path):
+    failed = QAUnit(query="失败候选", answer="不应发布", semantic_ok=False,
+                    publication_status="failed_review",
+                    sources=[Provenance(topic="模块")])
+    stats = export_all([failed], [], tmp_path)
+    import csv
+    rows = list(csv.reader(open(tmp_path / "qa_pairs.csv", encoding="utf-8-sig")))
+    assert stats.qa_units == 0
+    assert rows == [["Query", "Answer", "Module"]]
+
+
 def test_upload_zip_utf8_and_no_dsstore(tmp_path):
     """The zip must set the UTF-8 filename flag on CJK names (else mojibake on
     unzip) and never bundle .DS_Store."""
