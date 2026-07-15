@@ -4,6 +4,7 @@ import zipfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+import httpx
 import pytest
 from pathlib import Path
 
@@ -313,11 +314,17 @@ class _ConcurrencyLLM(LLMClient):
         self.current = 0
         self.peak = 0
         self.counter_lock = threading.Lock()
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
 
     def _post_chat(self, payload):
         with self.counter_lock:
             self.current += 1
             self.peak = max(self.peak, self.current)
+            is_first = not self.first_started.is_set()
+            self.first_started.set()
+        if is_first:
+            self.release_first.wait(timeout=1)
         time.sleep(0.01)
         with self.counter_lock:
             self.current -= 1
@@ -330,10 +337,48 @@ def test_llm_client_enforces_global_concurrency_limit():
         JD_LLM_TASK_MODELS="", JD_LLM_MAX_CONCURRENCY=2)
     client = _ConcurrencyLLM(settings)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        list(pool.map(lambda _: client.complete(system="s", user="u", model="Test-OpenAI"),
-                      range(8)))
+        futures = [pool.submit(client.complete, system="s", user="u",
+                               model="Test-OpenAI") for _ in range(8)]
+        assert client.first_started.wait(timeout=1)
+        time.sleep(0.02)
+        assert client.current == 1  # slow start: no full-capacity initial burst
+        client.release_first.set()
+        [future.result() for future in futures]
     assert client.peak == 2
     assert client.total_usage.calls == 8
+
+
+def test_llm_client_uses_multiplicative_decrease_on_gateway_congestion(monkeypatch):
+    class _RateLimitedClient:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, **kwargs):
+            self.calls += 1
+            request = httpx.Request("POST", url)
+            if self.calls == 1:
+                return httpx.Response(
+                    429, text='{"message":"rate limited"}', request=request)
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}]},
+                request=request)
+
+    settings = LLMSettings(
+        XIAOSHU_MODEL="Test-OpenAI", JD_LLM_FALLBACK_MODELS="",
+        JD_LLM_TASK_MODELS="", JD_LLM_MAX_CONCURRENCY=8,
+        JD_LLM_MAX_RETRIES=2)
+    transport = _RateLimitedClient()
+    client = LLMClient(settings=settings, client=transport)
+    for _ in range(7):
+        client._window.acquire()
+        client._window.release(successful=True)
+    assert client._window.limit == 8
+
+    monkeypatch.setattr("ragkb.llm.client.time.sleep", lambda _: None)
+    result = client.complete(system="s", user="u", model="Test-OpenAI")
+    assert result.text == "ok"
+    assert transport.calls == 2
+    assert client._window.limit == 4
 
 
 def test_public_state_strips_source_evidence_but_keeps_review_status():

@@ -40,6 +40,10 @@ class LLMError(RuntimeError):
     """Raised when the gateway cannot produce a completion after retries."""
 
 
+class _GatewayCongestionError(LLMError):
+    """Transient gateway overload used as congestion feedback by the client."""
+
+
 class LLMQuotaError(LLMError):
     """A model's quota is exhausted (gateway 429 / code 2001 '模型配额已用尽').
 
@@ -70,6 +74,57 @@ def _is_content_blocked(status_code: int, text: str) -> bool:
         return False
     t = text or ""
     return "sensitive contain" in t or "FAILED_PRECONDITION" in t
+
+
+class _AdaptiveConcurrencyWindow:
+    """TCP-style slow start plus additive-increase/multiplicative-decrease.
+
+    A fixed semaphore prevents unbounded concurrency but still admits its full
+    capacity as one initial burst. This window starts with one request, grows on
+    successful completions, and shrinks immediately when any thread observes
+    gateway congestion. The condition variable also makes the reduced window a
+    shared signal: other workers stop starting calls until in-flight work drains.
+    """
+
+    def __init__(self, maximum: int) -> None:
+        self.maximum = max(1, maximum)
+        self._window = 1.0
+        self._slow_start_threshold = float(self.maximum)
+        self._in_flight = 0
+        self._condition = threading.Condition()
+
+    @property
+    def limit(self) -> int:
+        with self._condition:
+            return max(1, min(self.maximum, int(self._window)))
+
+    def acquire(self) -> None:
+        with self._condition:
+            while self._in_flight >= max(1, int(self._window)):
+                self._condition.wait()
+            self._in_flight += 1
+
+    def release(self, *, successful: bool) -> None:
+        with self._condition:
+            self._in_flight -= 1
+            if successful and self._window < self.maximum:
+                if self._window < self._slow_start_threshold:
+                    # One additional permit per ACK doubles capacity per round.
+                    self._window = min(float(self.maximum), self._window + 1.0)
+                else:
+                    # Congestion avoidance: approximately one permit per window.
+                    self._window = min(
+                        float(self.maximum), self._window + 1.0 / self._window)
+            self._condition.notify_all()
+
+    def congestion(self) -> None:
+        with self._condition:
+            previous = self._window
+            self._slow_start_threshold = max(1.0, previous / 2.0)
+            self._window = self._slow_start_threshold
+            self._condition.notify_all()
+        log.warning("gateway congestion window reduced %.2f -> %.2f",
+                    previous, self._window)
 
 
 def _drop_rejected_temperature(payload: dict, status_code: int, body: str) -> bool:
@@ -181,7 +236,11 @@ class LLMClient:
         # new client and may probe again after quota has recovered.
         self._quota_lock = threading.Lock()
         self._quota_failures: dict[str, str] = {}
-        self._slots = threading.BoundedSemaphore(self.settings.max_concurrency)
+        # Start with one request and discover available gateway capacity from
+        # successful responses. A fixed semaphore starts at full capacity and
+        # creates exactly the synchronized burst that tends to trigger 429s.
+        self._window = _AdaptiveConcurrencyWindow(
+            self.settings.max_concurrency)
         self._usage_lock = threading.Lock()
         self.total_usage = LLMUsage()
 
@@ -225,6 +284,22 @@ class LLMClient:
         with self._quota_lock:
             self._quota_failures.setdefault(model, str(exc))
 
+    def _wait_before_retry(self, delay: float, *, congested: bool) -> None:
+        """Sleep before retrying, re-entering a reduced congestion window.
+
+        A congested attempt must not keep its old permit while sleeping and then
+        retransmit outside the smaller window. Returning the permit first makes
+        retries and fresh work compete under the same shared capacity signal.
+        """
+        if not congested:
+            time.sleep(delay)
+            return
+        self._window.release(successful=False)
+        try:
+            time.sleep(delay)
+        finally:
+            self._window.acquire()
+
     def _with_model_fallback(self, chain: list[str], fn):
         """Run `fn()` under each model in `chain`, advancing on quota exhaustion.
 
@@ -235,9 +310,11 @@ class LLMClient:
         last_quota: LLMQuotaError | None = None
         for model in self._available_models(chain):
             self._local.effective_model = model
+            successful = False
+            self._window.acquire()
             try:
-                with self._slots:
-                    res = fn()
+                res = fn()
+                successful = True
                 with self._usage_lock:
                     self.total_usage.add(res.usage)
                 self.last_model = res.model or model
@@ -248,6 +325,7 @@ class LLMClient:
                 log.warning("model %s quota exhausted; advancing fallback chain", model)
                 continue
             finally:
+                self._window.release(successful=successful)
                 self._local.effective_model = None
         raise last_quota or LLMError("no model available in fallback chain")
 
@@ -395,9 +473,12 @@ class LLMClient:
         last_quota: LLMQuotaError | None = None
         for m in self._available_models(chain):
             self._local.effective_model = m
+            successful = False
+            self._window.acquire()
             try:
                 self.last_model = m
                 yield from self._stream_once(messages, temperature, max_tokens)
+                successful = True
                 return
             except LLMQuotaError as exc:
                 last_quota = exc
@@ -405,6 +486,7 @@ class LLMClient:
                 log.warning("model %s quota exhausted (stream); trying next", m)
                 continue
             finally:
+                self._window.release(successful=successful)
                 self._local.effective_model = None
         raise last_quota or LLMError("no model available in fallback chain")
 
@@ -440,6 +522,8 @@ class LLMClient:
                             continue
                         if resp.status_code == 429 and _is_quota_body(body):
                             raise LLMQuotaError(f"quota exhausted: {body}")
+                        if resp.status_code == 429 or resp.status_code >= 500:
+                            self._window.congestion()
                         raise LLMError(f"gateway {resp.status_code}: {body}")
                     for line in resp.iter_lines():
                         if not line or not line.startswith("data:"):
@@ -463,6 +547,7 @@ class LLMClient:
                             yield {"type": "content", "text": c}
                     return
         except httpx.HTTPError as exc:
+            self._window.congestion()
             raise LLMError(f"stream failed: {exc}") from exc
 
     # ---- Anthropic Messages API adapter (Claude-* models) ---------------
@@ -530,19 +615,24 @@ class LLMClient:
                     # fallback: the filter is gateway-wide).
                     raise LLMContentBlockedError(f"content blocked: {resp.text[:200]}")
                 if resp.status_code == 429 or resp.status_code >= 500:
-                    raise LLMError(f"gateway {resp.status_code}: {resp.text[:200]}")
+                    raise _GatewayCongestionError(
+                        f"gateway {resp.status_code}: {resp.text[:200]}")
                 resp.raise_for_status()
                 return _anthropic_result(resp.json(), self._active_model())
             except (LLMQuotaError, LLMContentBlockedError):
                 raise  # bypass transient-retry; deterministic — no point retrying
             except (httpx.HTTPError, LLMError, KeyError, ValueError) as exc:
                 last_err = exc
+                congested = isinstance(
+                    exc, (_GatewayCongestionError, httpx.TransportError))
+                if congested:
+                    self._window.congestion()
                 wait = _retry_delay(attempt, resp.headers.get("Retry-After")
                                     if "resp" in locals() else None)
                 log.warning("anthropic call failed (attempt %d/%d): %s; retry in %ds",
                             attempt, self.settings.max_retries, exc, wait)
                 if attempt < self.settings.max_retries:
-                    time.sleep(wait)
+                    self._wait_before_retry(wait, congested=congested)
         raise LLMError(f"gateway failed after {self.settings.max_retries} attempts: {last_err}")
 
     def _anthropic_stream(self, *, system, messages, temperature, max_tokens
@@ -565,6 +655,8 @@ class LLMClient:
                             continue
                         if resp.status_code == 429 and _is_quota_body(body):
                             raise LLMQuotaError(f"quota exhausted: {body}")
+                        if resp.status_code == 429 or resp.status_code >= 500:
+                            self._window.congestion()
                         raise LLMError(f"gateway {resp.status_code}: {body}")
                     for line in resp.iter_lines():
                         if not line or not line.startswith("data:"):
@@ -586,6 +678,7 @@ class LLMClient:
                                 yield {"type": "content", "text": delta["text"]}
                     return
         except httpx.HTTPError as exc:
+            self._window.congestion()
             raise LLMError(f"stream failed: {exc}") from exc
 
     def _gemini_responses(self, *, system: str, user: str,
@@ -620,19 +713,24 @@ class LLMClient:
                 if _is_content_blocked(resp.status_code, resp.text):
                     raise LLMContentBlockedError(f"content blocked: {resp.text[:200]}")
                 if resp.status_code == 429 or resp.status_code >= 500:
-                    raise LLMError(f"gateway {resp.status_code}: {resp.text[:200]}")
+                    raise _GatewayCongestionError(
+                        f"gateway {resp.status_code}: {resp.text[:200]}")
                 resp.raise_for_status()
                 return _gemini_result(resp.json(), self._active_model())
             except (LLMQuotaError, LLMContentBlockedError):
                 raise
             except (httpx.HTTPError, LLMError, KeyError, ValueError) as exc:
                 last_err = exc
+                congested = isinstance(
+                    exc, (_GatewayCongestionError, httpx.TransportError))
+                if congested:
+                    self._window.congestion()
                 wait = _retry_delay(attempt, resp.headers.get("Retry-After")
                                     if "resp" in locals() else None)
                 log.warning("gemini call failed (attempt %d/%d): %s; retry in %ds",
                             attempt, self.settings.max_retries, exc, wait)
                 if attempt < self.settings.max_retries:
-                    time.sleep(wait)
+                    self._wait_before_retry(wait, congested=congested)
         raise LLMError(f"gateway failed after {self.settings.max_retries} attempts: {last_err}")
 
     def _post_chat(self, payload: dict) -> LLMResult:
@@ -659,7 +757,8 @@ class LLMClient:
                 if _is_content_blocked(resp.status_code, resp.text):
                     raise LLMContentBlockedError(f"content blocked: {resp.text[:200]}")
                 if resp.status_code == 429 or resp.status_code >= 500:
-                    raise LLMError(f"gateway {resp.status_code}: {resp.text[:200]}")
+                    raise _GatewayCongestionError(
+                        f"gateway {resp.status_code}: {resp.text[:200]}")
                 resp.raise_for_status()
                 data = resp.json()
                 choice = data["choices"][0]
@@ -697,12 +796,16 @@ class LLMClient:
                 raise  # bypass transient-retry; deterministic — no point retrying
             except (httpx.HTTPError, LLMError, KeyError, ValueError) as exc:
                 last_err = exc
+                congested = isinstance(
+                    exc, (_GatewayCongestionError, httpx.TransportError))
+                if congested:
+                    self._window.congestion()
                 wait = _retry_delay(attempt, resp.headers.get("Retry-After")
                                     if "resp" in locals() else None)
                 log.warning("LLM call failed (attempt %d/%d): %s; retrying in %ds",
                             attempt, self.settings.max_retries, exc, wait)
                 if attempt < self.settings.max_retries:
-                    time.sleep(wait)
+                    self._wait_before_retry(wait, congested=congested)
         raise LLMError(f"gateway failed after {self.settings.max_retries} attempts: {last_err}")
 
 
