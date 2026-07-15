@@ -217,8 +217,6 @@ REVIEW_USER = """审核下列问答对。每条给出 id、query、answer，以�
 
 返回 JSON 数组，每个元素：
 {{"id": <数字>, "verdict": "pass|revise|reject", "reason": "<不超过40字>",
-  "revised_query": "<仅需修订主问题时填写>",
-  "revised_answer": "<需修订回答时填写；基于原始材料给出可直接发布的完整答案>",
   "valid_paraphrases": ["<从输入问法变体中逐字复制审核通过的项；不得新增>"]}}
 必须覆盖所有 id。
 
@@ -270,3 +268,18 @@ def build_batch_paraphrase_user(items: list[dict], n: int) -> str:
             "只输出 JSON 数组并覆盖所有 id，格式："
             '[{"id":0,"variants":["问法1","问法2"]}]。\n数据：'
             + json.dumps(items, ensure_ascii=False, separators=(",", ":")))
+
+
+# --------------------------------------------------------- regeneration -----
+REGENERATE_VERSION = "v1"
+
+REGENERATE_SYSTEM = """你是知识库问答修复专家。上一版问答未通过审核，你必须仅依据给定原始材料
+重新生成。不得为了通过审核而删减原文中的必要步骤、条件、命令、数值或例外；原文覆盖多个必要
+环节时必须完整保留。禁止引入材料外事实。只输出 JSON。"""
+
+
+def build_regenerate_user(items: list[dict]) -> str:
+    import json
+    return ("逐条修复并覆盖所有 id。返回 JSON 数组："
+            '[{"id":0,"query":"用户问题","answer":"完整且忠于原文的回答"}]。\n'
+            "输入：" + json.dumps(items, ensure_ascii=False, separators=(",", ":")))

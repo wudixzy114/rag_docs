@@ -51,6 +51,9 @@ class QAUnit:
     semantic_ok: bool | None = None   # Layer2 strong-model gate (None = not yet run)
     semantic_reason: str = ""
     needs_review: bool = False
+    review_attempts: int = 0
+    publication_status: str = "pending"  # pending|approved|failed_review
+    review_history: list[str] = field(default_factory=list)
 
     def query_keys(self) -> list[str]:
         """All query strings that should point at this answer (main + paraphrases),

@@ -76,6 +76,12 @@ class Settings(BaseSettings):
     # Cross-review model: the reviewer (Layer 2) SHOULD differ from the extractor
     # for an independent perspective. Empty => reuse the `verify` task route.
     reviewer_model: str = ""
+    # Main production path stays source-faithful: generated query paraphrases are
+    # disabled unless an operator explicitly opts in for an experiment.
+    enable_paraphrases: bool = False
+    # A failed semantic review gets one source-grounded regeneration. More retries
+    # quickly multiply both generation and review cost with diminishing returns.
+    review_regeneration_attempts: int = Field(default=1, ge=0, le=3)
 
     @property
     def input_dir(self) -> Path:

@@ -23,7 +23,7 @@ from pathlib import Path
 # Bump when pipeline logic changes in a way that should force re-processing even
 # on unchanged sources (new prompt version, new stage). Combined with source_sha
 # into the skip decision.
-PIPELINE_VERSION = "v2"
+PIPELINE_VERSION = "v3"
 
 
 @dataclass

@@ -110,42 +110,41 @@ def test_export_csv_three_columns_with_module(tmp_path):
     rows = list(csv.reader(open(tmp_path / "qa_pairs.csv", encoding="utf-8-sig")))
     assert rows[0] == ["Query", "Answer", "Module"]
     assert all(len(r) == 3 for r in rows)                 # never misaligned
-    assert stats.qa_rows == 2                             # main query + 1 paraphrase
+    assert stats.qa_rows == 1                             # source-faithful main query only
     assert all(r[2] == "05_9Nctl常见问题汇总" for r in rows[1:])   # module column filled
     # per-module partition written too
     assert (tmp_path / "by_module" / "05_9Nctl常见问题汇总" / "qa_pairs.csv").is_file()
 
 
-def test_export_slim_variant_drops_paraphrases_to_separate_file(tmp_path):
-    """--no-paraphrase (include_paraphrases=False) writes ONE row per unit (main
-    query only) to a SEPARATE file, leaving the default inflated CSV untouched."""
+def test_export_expanded_variant_is_separate_from_primary(tmp_path):
+    """The primary artifact is source-faithful; expansion is opt-in and separate."""
     import csv
     u = QAUnit(query="任务OOM怎么办", answer="加内存",
                sources=[Provenance(topic="01_模型训练常见问题自查")])
     u.paraphrases = ["内存爆了咋整", "显存不够怎么处理"]
-    # Default export: 1 main + 2 paraphrases = 3 rows.
+    # Experimental expansion: 1 main + 2 paraphrases = 3 rows.
     full = export_all([u], [], tmp_path, include_paraphrases=True)
     assert full.qa_rows == 3
-    # Slim export: separate file, 1 row, default file NOT clobbered.
-    slim = export_all([u], [], tmp_path, include_paraphrases=False)
-    assert slim.qa_rows == 1
+    # Primary export remains one row and does not clobber the experiment.
+    primary = export_all([u], [], tmp_path, include_paraphrases=False)
+    assert primary.qa_rows == 1
     default_csv = tmp_path / "qa_pairs.csv"
-    slim_csv = tmp_path / "qa_pairs_no_paraphrase.csv"
-    assert default_csv.is_file() and slim_csv.is_file()          # both coexist
-    full_rows = list(csv.reader(open(default_csv, encoding="utf-8-sig")))
-    slim_rows = list(csv.reader(open(slim_csv, encoding="utf-8-sig")))
-    assert len(full_rows) == 4 and len(slim_rows) == 2           # +header each
-    assert slim_rows[0] == ["Query", "Answer", "Module"]
-    assert slim_rows[1][0] == "任务OOM怎么办"                     # only the main query
-    assert "内存爆了咋整" not in {r[0] for r in slim_rows}        # no paraphrase key
+    expanded_csv = tmp_path / "qa_pairs_with_paraphrase.csv"
+    assert default_csv.is_file() and expanded_csv.is_file()
+    primary_rows = list(csv.reader(open(default_csv, encoding="utf-8-sig")))
+    expanded_rows = list(csv.reader(open(expanded_csv, encoding="utf-8-sig")))
+    assert len(expanded_rows) == 4 and len(primary_rows) == 2
+    assert primary_rows[0] == ["Query", "Answer", "Module"]
+    assert primary_rows[1][0] == "任务OOM怎么办"
+    assert "内存爆了咋整" not in {r[0] for r in primary_rows}
     # Paraphrases still preserved in the sidecar regardless of variant.
     meta = [l for l in (tmp_path / "metadata.jsonl").read_text("utf-8").splitlines() if l]
     import json as _json
     rec = _json.loads(meta[0])
     assert "内存爆了咋整" in rec["query_keys"]
-    # Slim zip is a distinct artifact; default zip untouched.
+    # Experimental zip is distinct; primary zip remains the production artifact.
     assert (tmp_path / "知识库上传包.zip").is_file()
-    assert (tmp_path / "知识库上传包_无扩写.zip").is_file()
+    assert (tmp_path / "知识库上传包_含扩写.zip").is_file()
 
 
 def test_sop_filename_is_module_plus_section_number(tmp_path):

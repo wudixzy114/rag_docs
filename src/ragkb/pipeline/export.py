@@ -143,15 +143,15 @@ def _write_sop(sop_dir: Path, units: list[SOPUnit]) -> int:
 
 
 def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
-               output_dir: Path, include_paraphrases: bool = True) -> ExportStats:
+               output_dir: Path, include_paraphrases: bool = False) -> ExportStats:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     stats = ExportStats()
 
-    # Slim variant routes to its OWN filenames so the default (inflated) artifacts
-    # are never clobbered — both can coexist in output/.
-    csv_name = "qa_pairs.csv" if include_paraphrases else "qa_pairs_no_paraphrase.csv"
-    zip_name = "知识库上传包.zip" if include_paraphrases else "知识库上传包_无扩写.zip"
+    # Source-faithful output is the primary artifact. The opt-in expanded variant
+    # is written separately so experiments cannot replace production input.
+    csv_name = "qa_pairs_with_paraphrase.csv" if include_paraphrases else "qa_pairs.csv"
+    zip_name = "知识库上传包_含扩写.zip" if include_paraphrases else "知识库上传包.zip"
     _clear_generated(output_dir, csv_name)
 
     # 1. Global qa CSV (all modules, with Module column).
@@ -301,6 +301,9 @@ def load_results(output_dir: Path) -> tuple[list[QAUnit], list[SOPUnit]]:
                  needs_review=d.get("needs_review", False),
                  semantic_reason=d.get("semantic_reason", ""),
                  semantic_ok=d.get("semantic_ok", True),
+                 review_attempts=d.get("review_attempts", 0),
+                 publication_status=d.get("publication_status", "approved"),
+                 review_history=list(d.get("review_history", [])),
                  sources=[_prov_from_dict(s) for s in d.get("sources", [])])
           for d in data.get("qa", [])]
     sop = [SOPUnit(title=d["title"], markdown=d["markdown"],

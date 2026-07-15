@@ -142,38 +142,25 @@ def review_qa(units: list[QAUnit], llm: LLMClient,
 
     for i, u in indexed:
         if i not in verdicts:
-            if policy == "keep":
-                u.semantic_ok = True
-                u.needs_review = True
-                u.semantic_reason = "no_verdict:kept_for_review"
-            else:
-                u.semantic_ok = False
-                u.semantic_reason = "no_verdict:dropped"
+            u.semantic_ok = False
+            u.needs_review = True
+            u.publication_status = "failed_review"
+            u.semantic_reason = "no_verdict"
             continue
         result = verdicts[i]
         u.semantic_reason = f"{result.verdict}:{result.reason}"
         _filter_paraphrases(u, result.valid_paraphrases)
         if result.verdict == "pass":
             u.semantic_ok = True
-        elif result.verdict == "revise" and (result.revised_answer or result.revised_query):
-            original_answer, original_query = u.answer, u.query
-            if result.revised_answer:
-                u.answer = result.revised_answer
-            if result.revised_query:
-                u.query = result.revised_query
-            gate_qa(u)
-            if u.struct_ok:
-                u.semantic_ok = True
-                u.needs_review = False
-            else:
-                u.answer, u.query = original_answer, original_query
-                u.semantic_ok = False
-                u.semantic_reason += ":invalid_revision"
+            u.publication_status = "approved"
         elif result.verdict == "revise":
             u.semantic_ok = False
-            u.semantic_reason += ":missing_revision"
+            u.needs_review = True
+            u.publication_status = "failed_review"
         else:
             u.semantic_ok = False
+            u.needs_review = True
+            u.publication_status = "failed_review"
     return units
 
 
@@ -187,18 +174,11 @@ def _apply_known(units: list[QAUnit], verdicts: dict[int, _Verdict]) -> None:
         _filter_paraphrases(unit, result.valid_paraphrases)
         if result.verdict == "pass":
             unit.semantic_ok = True
-        elif result.verdict == "revise" and (result.revised_answer or result.revised_query):
-            original_answer, original_query = unit.answer, unit.query
-            unit.answer = result.revised_answer or unit.answer
-            unit.query = result.revised_query or unit.query
-            gate_qa(unit)
-            if unit.struct_ok:
-                unit.semantic_ok = True
-            else:
-                unit.answer, unit.query = original_answer, original_query
-                unit.semantic_ok = False
+            unit.publication_status = "approved"
         else:
             unit.semantic_ok = False
+            unit.needs_review = True
+            unit.publication_status = "failed_review"
 
 
 def _filter_paraphrases(unit: QAUnit, approved: list[str] | None) -> None:
@@ -208,11 +188,11 @@ def _filter_paraphrases(unit: QAUnit, approved: list[str] | None) -> None:
 
 
 def _mark_skipped(units: list[QAUnit]) -> None:
-    """Reviewer unavailable: keep every unit that hasn't already been rejected,
-    flag it for human review. Units already reviewed this run keep their verdict."""
+    """Reviewer unavailable: retain but never approve an unreviewed unit."""
     for u in units:
         if u.semantic_ok is None:
             u.paraphrases = []
-            u.semantic_ok = True
+            u.semantic_ok = False
             u.needs_review = True
-            u.semantic_reason = "review_skipped:no_quota"
+            u.publication_status = "failed_review"
+            u.semantic_reason = "review_unavailable:no_quota"

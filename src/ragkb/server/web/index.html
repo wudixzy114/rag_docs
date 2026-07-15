@@ -1,195 +1,377 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>诊断知识库流水线</title>
+<title>RAG 文档流水线</title>
 <style>
   :root {
-    --bg:#0f1115; --panel:#181b22; --panel2:#1f232c; --line:#2a2f3a;
-    --fg:#e6e8ee; --muted:#8b93a3; --accent:#4f9dff;
-    --ok:#3fb96a; --warn:#e0a53f; --err:#e0554f; --pin:#c07bf0;
+    --bg:#f4f6f8; --surface:#ffffff; --surface-2:#f8fafb; --line:#d9dee5;
+    --text:#18212b; --muted:#647180; --quiet:#8994a1; --accent:#1769aa;
+    --accent-soft:#e8f2fa; --ok:#16794b; --ok-soft:#e8f5ee; --warn:#9a6200;
+    --warn-soft:#fff3d9; --error:#b42318; --error-soft:#fdecea; --ink:#263746;
   }
   * { box-sizing:border-box; }
-  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--fg); }
-  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; position:sticky; top:0; background:var(--bg); z-index:10; }
-  header h1 { font-size:16px; margin:0; font-weight:600; }
-  .btn { background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
-  .btn:hover { border-color:var(--accent); }
-  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  .btn:disabled { opacity:.5; cursor:not-allowed; }
-  .spacer { flex:1; }
-  .stats { display:flex; gap:18px; color:var(--muted); font-size:13px; }
-  .stats b { color:var(--fg); }
-  .wrap { display:grid; grid-template-columns:340px 1fr; gap:0; height:calc(100vh - 53px); }
-  .sidebar { border-right:1px solid var(--line); overflow-y:auto; padding:12px; }
-  .main { overflow-y:auto; padding:16px 20px; }
-  .doc { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:10px; cursor:pointer; }
-  .doc:hover { border-color:var(--accent); }
-  .doc.sel { border-color:var(--accent); }
-  .doc-top { display:flex; align-items:center; gap:8px; }
-  .doc-name { font-weight:600; font-size:13px; flex:1; word-break:break-all; }
-  .dot { width:8px; height:8px; border-radius:50%; flex:none; }
-  .s-pending{background:var(--muted)} .s-running{background:var(--accent); animation:pulse 1s infinite}
-  .s-done{background:var(--ok)} .s-failed{background:var(--err)} .s-pinned{background:var(--pin)}
-  .s-skipped{background:#556}
-  @keyframes pulse { 50%{opacity:.35} }
-  .doc-meta { color:var(--muted); font-size:12px; margin-top:4px; display:flex; gap:10px; flex-wrap:wrap; }
-  .doc-actions { margin-top:8px; display:flex; gap:6px; }
-  .doc-actions .btn { padding:3px 8px; font-size:12px; }
-  .bar { height:4px; background:var(--panel2); border-radius:2px; margin-top:8px; overflow:hidden; }
-  .bar > i { display:block; height:100%; background:var(--accent); width:0; transition:width .3s; }
-  .unit { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin-bottom:10px; }
-  .unit.sop { border-left:3px solid var(--pin); }
-  .unit.qa { border-left:3px solid var(--accent); }
-  .unit .q { font-weight:600; margin-bottom:6px; }
-  .unit .a { white-space:pre-wrap; color:#cdd3de; font-size:13px; }
-  .tag { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; background:var(--panel2); color:var(--muted); margin-left:6px; }
-  .tag.review { background:#3a2f18; color:var(--warn); }
-  .tag.err { background:#3a1e1c; color:var(--err); }
-  .keys { margin-top:8px; font-size:12px; color:var(--muted); }
-  .keys code { background:var(--panel2); padding:1px 6px; border-radius:4px; margin:2px 4px 2px 0; display:inline-block; }
-  .filter { display:flex; gap:6px; margin-bottom:12px; }
-  .filter input { flex:1; background:var(--panel2); border:1px solid var(--line); color:var(--fg); border-radius:6px; padding:6px 10px; }
-  .empty { color:var(--muted); text-align:center; margin-top:60px; }
-  .log { font-family:ui-monospace,monospace; font-size:12px; color:var(--muted); background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 10px; margin-bottom:12px; max-height:120px; overflow-y:auto; white-space:pre-wrap; }
-  h2.sec { font-size:13px; color:var(--muted); margin:18px 0 8px; text-transform:uppercase; letter-spacing:.05em; }
+  html, body { margin:0; min-height:100%; background:var(--bg); color:var(--text); }
+  body { font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  button, input, select { font:inherit; }
+  button { letter-spacing:0; }
+  .app-header { height:58px; padding:0 18px; display:flex; align-items:center; gap:14px; background:var(--surface); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:20; }
+  .brand { display:flex; align-items:center; gap:10px; min-width:250px; }
+  .brand-mark { width:28px; height:28px; display:grid; place-items:center; background:var(--ink); color:#fff; border-radius:6px; font-weight:700; font-size:12px; }
+  .brand strong { display:block; font-size:14px; }
+  .brand span { display:block; color:var(--muted); font-size:11px; }
+  .connection { display:inline-flex; align-items:center; gap:6px; color:var(--muted); font-size:12px; }
+  .connection i { width:7px; height:7px; border-radius:50%; background:var(--quiet); }
+  .connection.online i { background:var(--ok); }
+  .connection.offline i { background:var(--error); }
+  .header-spacer { flex:1; }
+  .header-model { color:var(--muted); font-size:12px; max-width:270px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .btn { min-height:34px; border:1px solid var(--line); color:var(--text); background:var(--surface); border-radius:6px; padding:6px 10px; cursor:pointer; display:inline-flex; align-items:center; justify-content:center; gap:7px; }
+  .btn:hover { border-color:#9eabb8; background:var(--surface-2); }
+  .btn.primary { color:#fff; border-color:var(--accent); background:var(--accent); }
+  .btn.danger { color:var(--error); }
+  .btn.icon { width:34px; padding:0; font-size:16px; }
+  .btn:disabled { cursor:not-allowed; opacity:.48; }
+  .shell { height:calc(100vh - 58px); display:grid; grid-template-columns:300px minmax(520px,1fr) 330px; }
+  .sidebar, .activity { background:var(--surface); min-height:0; overflow:auto; }
+  .sidebar { border-right:1px solid var(--line); }
+  .activity { border-left:1px solid var(--line); }
+  .main { min-width:0; overflow:auto; }
+  .pane-head { min-height:52px; padding:12px 14px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:8px; position:sticky; top:0; background:var(--surface); z-index:5; }
+  .pane-head h2 { font-size:13px; margin:0; }
+  .count { color:var(--muted); font-size:12px; }
+  .search { margin:10px 12px; position:relative; }
+  .search input { width:100%; height:34px; padding:6px 9px 6px 30px; border:1px solid var(--line); border-radius:6px; background:var(--surface-2); color:var(--text); }
+  .search span { position:absolute; left:10px; top:7px; color:var(--quiet); }
+  .doc-list { border-top:1px solid var(--line); }
+  .doc-row { width:100%; text-align:left; border:0; border-bottom:1px solid #edf0f3; background:var(--surface); padding:11px 12px; cursor:pointer; }
+  .doc-row:hover { background:var(--surface-2); }
+  .doc-row.selected { background:var(--accent-soft); box-shadow:inset 3px 0 0 var(--accent); }
+  .doc-line { display:flex; align-items:flex-start; gap:8px; }
+  .status-dot { width:8px; height:8px; margin-top:6px; border-radius:50%; flex:none; background:var(--quiet); }
+  .status-dot.running { background:var(--accent); animation:pulse 1.2s infinite; }
+  .status-dot.done { background:var(--ok); }
+  .status-dot.failed { background:var(--error); }
+  .status-dot.pinned { background:#6d4bb3; }
+  .doc-name { min-width:0; flex:1; font-weight:600; font-size:13px; overflow-wrap:anywhere; }
+  .doc-status { color:var(--muted); font-size:11px; flex:none; }
+  .doc-meta { margin:5px 0 0 16px; color:var(--muted); display:flex; gap:10px; font-size:11px; }
+  .mini-progress { height:3px; background:#e7ebef; margin:8px 0 0 16px; }
+  .mini-progress i { display:block; height:100%; background:var(--accent); }
+  .summary-band { min-height:72px; padding:10px 18px; display:grid; grid-template-columns:repeat(5,minmax(90px,1fr)); gap:1px; background:var(--line); border-bottom:1px solid var(--line); }
+  .metric { background:var(--surface); padding:8px 12px; }
+  .metric span { display:block; color:var(--muted); font-size:11px; }
+  .metric strong { display:block; margin-top:2px; font-size:19px; line-height:1.2; }
+  .error-banner { margin:14px 18px 0; padding:10px 12px; background:var(--error-soft); border:1px solid #f2c7c3; color:var(--error); border-radius:6px; display:none; }
+  .detail-head { padding:16px 18px 12px; display:flex; align-items:flex-start; gap:14px; }
+  .detail-title { min-width:0; flex:1; }
+  .detail-title h1 { margin:0; font-size:18px; overflow-wrap:anywhere; }
+  .detail-title p { margin:3px 0 0; color:var(--muted); font-size:12px; }
+  .detail-actions { display:flex; gap:7px; }
+  .pipeline { padding:0 18px 16px; display:grid; grid-template-columns:repeat(7,minmax(78px,1fr)); }
+  .stage { position:relative; padding:0 8px 0 0; min-width:0; }
+  .stage:not(:last-child)::after { content:""; position:absolute; top:10px; left:22px; right:0; height:1px; background:var(--line); }
+  .stage-node { width:21px; height:21px; position:relative; z-index:1; border:1px solid var(--line); background:var(--surface); display:grid; place-items:center; border-radius:50%; font-size:11px; color:var(--quiet); }
+  .stage.done .stage-node { color:#fff; background:var(--ok); border-color:var(--ok); }
+  .stage.running .stage-node { color:#fff; background:var(--accent); border-color:var(--accent); animation:pulse 1.2s infinite; }
+  .stage.failed .stage-node { color:#fff; background:var(--error); border-color:var(--error); }
+  .stage-name { margin-top:5px; font-size:11px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .stage-detail { font-size:10px; color:var(--quiet); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tabs { display:flex; gap:2px; padding:0 18px; border-bottom:1px solid var(--line); background:var(--surface); position:sticky; top:0; z-index:4; }
+  .tab { border:0; border-bottom:2px solid transparent; background:transparent; padding:10px 12px 9px; color:var(--muted); cursor:pointer; }
+  .tab.active { color:var(--accent); border-bottom-color:var(--accent); font-weight:600; }
+  .toolbar { padding:10px 18px; display:flex; align-items:center; gap:8px; border-bottom:1px solid #edf0f3; }
+  .toolbar input { width:min(360px,100%); height:32px; border:1px solid var(--line); border-radius:6px; padding:5px 9px; background:var(--surface); }
+  .unit-list { background:var(--surface); }
+  .unit-row { padding:14px 18px; border-bottom:1px solid #e8ecf0; }
+  .unit-top { display:flex; gap:10px; align-items:flex-start; }
+  .unit-title { flex:1; font-weight:600; overflow-wrap:anywhere; }
+  .unit-answer { color:#344454; white-space:pre-wrap; margin-top:8px; font-size:13px; max-height:240px; overflow:auto; }
+  .unit-meta { margin-top:9px; display:flex; align-items:center; flex-wrap:wrap; gap:8px; color:var(--muted); font-size:11px; }
+  .chip { display:inline-flex; align-items:center; min-height:22px; padding:2px 7px; border-radius:5px; font-size:11px; background:#eef1f4; color:var(--muted); }
+  .chip.ok { background:var(--ok-soft); color:var(--ok); }
+  .chip.warn { background:var(--warn-soft); color:var(--warn); }
+  .chip.error { background:var(--error-soft); color:var(--error); }
+  .reason { margin-top:8px; padding:8px 10px; border-left:3px solid var(--error); background:#fff8f7; color:#7e2d27; font-size:12px; white-space:pre-wrap; }
+  .empty { padding:48px 20px; color:var(--muted); text-align:center; }
+  .event-list { padding-bottom:20px; }
+  .event { padding:10px 12px; border-bottom:1px solid #edf0f3; }
+  .event-top { display:flex; gap:8px; align-items:center; }
+  .event-kind { width:7px; height:7px; border-radius:50%; background:var(--quiet); flex:none; }
+  .event.error .event-kind, .event.failed .event-kind { background:var(--error); }
+  .event.done .event-kind { background:var(--ok); }
+  .event.running .event-kind { background:var(--accent); }
+  .event-topic { flex:1; font-size:12px; font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .event-time { color:var(--quiet); font-size:10px; }
+  .event-message { margin:3px 0 0 15px; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+  .toast { position:fixed; right:18px; bottom:18px; max-width:420px; padding:10px 12px; color:#fff; background:var(--ink); border-radius:6px; box-shadow:0 8px 24px #23303d33; z-index:50; display:none; }
+  .toast.error { background:var(--error); }
+  @keyframes pulse { 50% { opacity:.45; } }
+  @media (max-width:1180px) {
+    .shell { grid-template-columns:280px minmax(500px,1fr); }
+    .activity { display:none; }
+    .header-model { display:none; }
+  }
+  @media (max-width:760px) {
+    .app-header { height:auto; min-height:58px; flex-wrap:wrap; padding:8px 10px; }
+    .brand { min-width:0; flex:1; }
+    .connection { order:3; width:100%; }
+    .shell { height:auto; display:block; }
+    .sidebar { border-right:0; max-height:280px; border-bottom:1px solid var(--line); }
+    .summary-band { grid-template-columns:repeat(3,1fr); padding:8px; }
+    .metric { padding:7px; }
+    .pipeline { grid-template-columns:repeat(4,1fr); row-gap:12px; }
+    .stage:nth-child(4)::after { display:none; }
+    .detail-head { padding:14px 12px; }
+    .detail-actions { flex-direction:column; }
+    .tabs, .toolbar { padding-left:12px; padding-right:12px; }
+    .unit-row { padding:12px; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <h1>诊断知识库流水线</h1>
-  <button class="btn primary" id="runAll">▶ 运行全部</button>
-  <button class="btn" id="exportBtn">⬇ 导出 CSV/SOP</button>
-  <div class="spacer"></div>
-  <div class="stats" id="stats"></div>
+<header class="app-header">
+  <div class="brand"><div class="brand-mark">RAG</div><div><strong>文档清洗流水线</strong><span>source-faithful pipeline</span></div></div>
+  <div class="connection" id="connection"><i></i><span>正在连接</span></div>
+  <div class="header-spacer"></div>
+  <div class="header-model" id="modelInfo" title="当前模型路由"></div>
+  <button class="btn" id="exportBtn" title="导出已通过审核的结果"><span>⇩</span><span>导出</span></button>
+  <button class="btn primary" id="runBtn" title="运行全部文档"><span>▶</span><span>运行全部</span></button>
 </header>
-<div class="wrap">
-  <div class="sidebar">
-    <div id="docs"></div>
-  </div>
-  <div class="main">
-    <div class="log" id="log" style="display:none"></div>
-    <div class="filter">
-      <input id="q" placeholder="过滤问答（输入关键词）…">
-      <span class="stats" style="align-items:center"><span id="viewTitle">全部</span></span>
-    </div>
-    <div id="units"><div class="empty">运行流水线后，这里实时显示每篇文档抽取出的问答与流程。</div></div>
-  </div>
+
+<div class="shell">
+  <aside class="sidebar">
+    <div class="pane-head"><h2>文档队列</h2><span class="count" id="docCount"></span></div>
+    <div class="search"><span>⌕</span><input id="docSearch" placeholder="搜索文档"></div>
+    <div class="doc-list" id="docList"></div>
+  </aside>
+
+  <main class="main">
+    <section class="summary-band" id="metrics"></section>
+    <div class="error-banner" id="errorBanner"></div>
+    <section class="detail-head">
+      <div class="detail-title"><h1 id="detailTitle">全部文档</h1><p id="detailMeta"></p></div>
+      <div class="detail-actions">
+        <button class="btn icon" id="pinBtn" title="固定或取消固定">◇</button>
+        <button class="btn" id="retryBtn" title="重新处理当前文档"><span>↻</span><span>重试</span></button>
+      </div>
+    </section>
+    <section class="pipeline" id="pipeline"></section>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="qa">QA <span id="qaCount">0</span></button>
+      <button class="tab" data-tab="sop">SOP <span id="sopCount">0</span></button>
+      <button class="tab" data-tab="failed">失败 <span id="failedCount">0</span></button>
+    </nav>
+    <div class="toolbar"><input id="unitSearch" placeholder="筛选当前结果"><span class="count" id="resultCount"></span></div>
+    <section class="unit-list" id="unitList"></section>
+  </main>
+
+  <aside class="activity">
+    <div class="pane-head"><h2>实时事件</h2><span class="count" id="eventCount"></span></div>
+    <div class="event-list" id="eventList"></div>
+  </aside>
 </div>
+<div class="toast" id="toast"></div>
+
 <script>
-const S = { docs:{}, units:{}, sel:null, running:false };
-const $ = s => document.querySelector(s);
+const STAGES = [
+  ['parse','解析'], ['vision','图片'], ['classify','分类'], ['extract','抽取'],
+  ['validate','校验'], ['regenerate','重生成'], ['review','审核']
+];
+const STATUS_TEXT = {pending:'待处理',running:'运行中',done:'完成',failed:'失败',pinned:'已固定',skipped:'已跳过'};
+const S = {docs:{}, units:{}, stages:{}, events:[], errors:[], models:{}, usage:{}, lastRun:{}, selected:null, tab:'qa', running:false, seq:0};
+const $ = selector => document.querySelector(selector);
 
-function api(path, body){ return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(r=>r.json()); }
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtTime(ts) { return ts ? new Date(ts * 1000).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : ''; }
+function fmtNum(n) { return Number(n || 0).toLocaleString('zh-CN'); }
+function topicOf(unit) { return unit.sources?.[0]?.topic || '_unknown'; }
+function unitsFor(topic) { return topic ? (S.units[topic] || []) : Object.values(S.units).flat(); }
+function approved(unit) { return unit.unit_kind === 'qa' && (unit.publication_status || (unit.semantic_ok ? 'approved' : 'failed_review')) === 'approved'; }
+function failed(unit) { return unit.unit_kind === 'qa' && !approved(unit); }
 
-function renderStats(){
-  const d = Object.values(S.docs);
-  const done = d.filter(x=>x.status==='done').length;
-  const run = d.filter(x=>x.status==='running').length;
-  const qa = d.reduce((a,x)=>a+(x.passed||0),0);
-  const rev = d.reduce((a,x)=>a+(x.needs_review||0),0);
-  const sop = d.reduce((a,x)=>a+(x.sop_count||0),0);
-  $('#stats').innerHTML = `<span>文档 <b>${done}/${d.length}</b></span>`+
-    (run?`<span>运行中 <b>${run}</b></span>`:'')+
-    `<span>QA <b>${qa}</b></span><span>SOP <b>${sop}</b></span>`+
-    (rev?`<span>待审 <b style="color:var(--warn)">${rev}</b></span>`:'');
+function toast(message, isError=false) {
+  const node = $('#toast'); node.textContent = message; node.className = 'toast' + (isError ? ' error' : ''); node.style.display='block';
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => node.style.display='none', 3600);
+}
+async function api(path, body={}) {
+  let response;
+  try { response = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }
+  catch (error) { toast('网络请求失败：' + error.message, true); throw error; }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) { const message = data.detail || `请求失败 (${response.status})`; toast(message, true); throw new Error(message); }
+  return data;
 }
 
-function docCard(d){
-  const sel = S.sel===d.topic?' sel':'';
-  const pinLabel = d.pinned?'📌 已固定':'固定';
-  const prog = S.docs[d.topic]._prog;
-  const barHtml = (d.status==='running'&&prog)?`<div class="bar"><i style="width:${Math.round(prog.done/prog.total*100)}%"></i></div>`:'';
-  return `<div class="doc${sel}" data-topic="${d.topic}">
-    <div class="doc-top"><span class="dot s-${d.status}"></span><span class="doc-name">${d.topic}</span></div>
-    <div class="doc-meta"><span>QA ${d.passed||0}</span><span>SOP ${d.sop_count||0}</span>
-      ${d.needs_review?`<span style="color:var(--warn)">待审 ${d.needs_review}</span>`:''}
-      ${d.status==='failed'?`<span style="color:var(--err)">失败</span>`:''}</div>
-    ${barHtml}
-    <div class="doc-actions">
-      <button class="btn" data-act="pin" data-topic="${d.topic}">${pinLabel}</button>
-      <button class="btn" data-act="retry" data-topic="${d.topic}">重试</button>
-    </div></div>`;
-}
-function renderDocs(){
-  const arr = Object.values(S.docs).sort((a,b)=>a.topic.localeCompare(b.topic));
-  $('#docs').innerHTML = arr.map(docCard).join('') || '<div class="empty">未发现文档</div>';
-}
-
-function unitHtml(u){
-  if(u.unit_kind==='sop'){
-    const eqs=(u.entry_questions||[]).map(q=>`<code>${esc(q)}</code>`).join('');
-    return `<div class="unit sop"><div class="q">📋 ${esc(u.title||'')}${u.struct_ok===false?'<span class="tag err">结构异常</span>':''}</div>
-      <div class="keys">入口问题：${eqs}</div></div>`;
+function hydrate(data) {
+  S.running = Boolean(data.running);
+  S.docs = Object.fromEntries((data.docs || []).map(doc => [doc.topic, {...S.docs[doc.topic], ...doc}]));
+  S.stages = data.stages || S.stages;
+  S.errors = data.errors || [];
+  S.models = data.models || {};
+  S.usage = data.usage || {};
+  S.lastRun = data.last_run || {};
+  const nextUnits = {};
+  for (const unit of data.results?.qa || []) {
+    const topic = topicOf(unit); (nextUnits[topic] ||= []).push({...unit,unit_kind:'qa'});
   }
-  const keys=(u.query_keys||[]).slice(1).map(k=>`<code>${esc(k)}</code>`).join('');
-  return `<div class="unit qa"><div class="q">${esc(u.query||'')}
-    ${u.needs_review?'<span class="tag review">待审</span>':''}
-    ${u.truncated?'<span class="tag err">截断</span>':''}</div>
-    <div class="a">${esc(u.answer||'')}</div>
-    ${keys?`<div class="keys">近义键：${keys}</div>`:''}</div>`;
-}
-function renderUnits(){
-  const filter=$('#q').value.trim().toLowerCase();
-  let list=[];
-  const topics = S.sel? [S.sel] : Object.keys(S.units);
-  $('#viewTitle').textContent = S.sel || '全部';
-  topics.forEach(t=>{ (S.units[t]||[]).forEach(u=>list.push(u)); });
-  if(filter) list=list.filter(u=>JSON.stringify(u).toLowerCase().includes(filter));
-  $('#units').innerHTML = list.length? list.map(unitHtml).join('')
-    : '<div class="empty">暂无内容。运行或选择一篇文档。</div>';
-}
-function esc(s){ return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-
-function addLog(msg){ const el=$('#log'); el.style.display='block'; el.textContent=(msg+'\n'+el.textContent).slice(0,4000); }
-
-function onEvent(ev){
-  if(ev.kind==='doc_status'){
-    const t=ev.topic; S.docs[t]=S.docs[t]||{topic:t}; S.docs[t].status=ev.data.status;
-    if(ev.data.status==='pinned') S.docs[t].pinned=true;
-    if(ev.data.status==='unpinned') S.docs[t].pinned=false;
-    renderDocs(); renderStats();
-  } else if(ev.kind==='doc_progress'){
-    const t=ev.topic; if(S.docs[t]){ S.docs[t]._prog={done:ev.data.done,total:ev.data.total}; renderDocs(); }
-  } else if(ev.kind==='unit'){
-    const t=ev.topic; S.units[t]=S.units[t]||[];
-    S.units[t].push(ev.data); renderUnits();
-  } else if(ev.kind==='run_status'){
-    if(ev.data.status==='started'){ S.running=true; $('#runAll').disabled=true; Object.keys(S.units).forEach(k=>delete S.units[k]); }
-    if(ev.data.status==='done'){ S.running=false; $('#runAll').disabled=false; refreshState(); }
-    if(ev.data.status==='exported'){ addLog(`导出完成：QA ${ev.data.qa_units} 单元 / ${ev.data.qa_rows} 行，SOP ${ev.data.sop_files} 篇，待审 ${ev.data.needs_review}`); }
-  } else if(ev.kind==='log'){ addLog(ev.data.message||''); }
-  else if(ev.kind==='error'){ addLog('❌ '+ev.topic+': '+(ev.data.message||'')); }
+  for (const unit of data.results?.sop || []) {
+    const topic = topicOf(unit); (nextUnits[topic] ||= []).push({...unit,unit_kind:'sop'});
+  }
+  S.units = nextUnits;
+  S.events = (data.events || []).slice(-300);
+  S.seq = Math.max(S.seq, ...S.events.map(event => event.seq || 0), 0);
+  const topics = Object.keys(S.docs).sort();
+  if (!S.selected || !S.docs[S.selected]) S.selected = topics.find(t => S.docs[t].status === 'running') || topics[0] || null;
+  render();
 }
 
-function refreshState(){
-  fetch('/api/state').then(r=>r.json()).then(d=>{
-    (d.docs||[]).forEach(x=>S.docs[x.topic]=Object.assign(S.docs[x.topic]||{},x));
-    // load persisted QA/SOP into the unit view keyed by topic
-    const res=d.results||{};
-    (res.qa||[]).forEach(u=>{ const t=(u.sources&&u.sources[0]&&u.sources[0].topic)||''; S.units[t]=S.units[t]||[];
-      if(!S.units[t].some(x=>x.query===u.query)) S.units[t].push({unit_kind:'qa',query:u.query,answer:u.answer,query_keys:[u.query,...(u.paraphrases||[])],needs_review:u.needs_review}); });
-    (res.sop||[]).forEach(u=>{ const t=(u.sources&&u.sources[0]&&u.sources[0].topic)||''; S.units[t]=S.units[t]||[];
-      if(!S.units[t].some(x=>x.title===u.title)) S.units[t].push({unit_kind:'sop',title:u.title,entry_questions:u.entry_questions,struct_ok:u.struct_ok}); });
-    renderDocs(); renderStats(); renderUnits();
+async function refreshState(silent=false) {
+  try {
+    const response = await fetch('/api/state',{cache:'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    hydrate(await response.json());
+  } catch (error) { if (!silent) toast('状态同步失败：' + error.message, true); setConnection('offline','同步失败'); }
+}
+
+function setConnection(kind, text) {
+  const node = $('#connection'); node.className = 'connection ' + kind; node.querySelector('span').textContent = text;
+}
+
+function onEvent(event) {
+  if (!event || (event.seq && event.seq <= S.seq)) return;
+  S.seq = Math.max(S.seq, event.seq || 0);
+  S.events.push(event); if (S.events.length > 300) S.events.shift();
+  const data = event.data || {}, topic = event.topic;
+  if (event.kind === 'doc_status') {
+    S.docs[topic] ||= {topic}; S.docs[topic].status = data.status;
+    if (data.status === 'pinned') S.docs[topic].pinned = true;
+    if (data.status === 'unpinned') S.docs[topic].pinned = false;
+  } else if (event.kind === 'stage') {
+    S.stages[topic] ||= {}; S.stages[topic][data.stage || 'unknown'] = {...data,seq:event.seq,ts:event.ts};
+  } else if (event.kind === 'error') {
+    S.errors.push(event);
+  } else if (event.kind === 'run_status') {
+    S.lastRun = {...data,seq:event.seq,ts:event.ts};
+    S.running = data.status === 'started';
+    if (data.status === 'done' || data.status === 'failed') refreshState(true);
+    if (data.status === 'exported') toast(`导出完成：${data.qa_units || 0} QA / ${data.sop_files || 0} SOP`);
+  }
+  render();
+}
+
+function render() {
+  renderHeader(); renderMetrics(); renderDocs(); renderDetail(); renderEvents();
+}
+function renderHeader() {
+  $('#runBtn').disabled = S.running; $('#exportBtn').disabled = S.running;
+  $('#runBtn').innerHTML = S.running ? '<span>●</span><span>运行中</span>' : '<span>▶</span><span>运行全部</span>';
+  $('#modelInfo').textContent = S.models.extract ? `抽取 ${S.models.extract} · 审核 ${S.models.review}` : '';
+}
+function renderMetrics() {
+  const docs = Object.values(S.docs), units = Object.values(S.units).flat();
+  const values = [
+    ['文档', `${docs.filter(d=>d.status==='done').length}/${docs.length}`],
+    ['已批准 QA', units.filter(approved).length],
+    ['审核失败', units.filter(failed).length],
+    ['SOP', units.filter(u=>u.unit_kind==='sop').length],
+    ['模型调用', fmtNum(S.lastRun.calls ?? S.usage.calls)],
+  ];
+  $('#metrics').innerHTML = values.map(([label,value]) => `<div class="metric"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join('');
+}
+function docProgress(topic) {
+  const stages = S.stages[topic] || {}, relevant = STAGES.filter(([key]) => key !== 'regenerate');
+  const done = relevant.filter(([key]) => stages[key]?.status === 'done').length;
+  return Math.round(done / relevant.length * 100);
+}
+function renderDocs() {
+  const query = $('#docSearch').value.trim().toLowerCase();
+  const docs = Object.values(S.docs).filter(doc => !query || doc.topic.toLowerCase().includes(query)).sort((a,b) => {
+    const rank={running:0,failed:1,pending:2,done:3,pinned:4,skipped:5}; return (rank[a.status]??9)-(rank[b.status]??9)||a.topic.localeCompare(b.topic);
   });
+  $('#docCount').textContent = `${docs.length} 篇`;
+  $('#docList').innerHTML = docs.length ? docs.map(doc => {
+    const status = doc.status || 'pending', progress = docProgress(doc.topic);
+    return `<button class="doc-row${S.selected===doc.topic?' selected':''}" data-topic="${esc(doc.topic)}">
+      <div class="doc-line"><i class="status-dot ${esc(status)}"></i><span class="doc-name">${esc(doc.topic)}</span><span class="doc-status">${esc(STATUS_TEXT[status]||status)}</span></div>
+      <div class="doc-meta"><span>QA ${doc.passed||0}</span><span>失败 ${doc.rejected||0}</span><span>SOP ${doc.sop_count||0}</span></div>
+      ${status==='running'?`<div class="mini-progress"><i style="width:${progress}%"></i></div>`:''}
+    </button>`;
+  }).join('') : '<div class="empty">没有匹配文档</div>';
+}
+function renderDetail() {
+  const doc = S.selected ? S.docs[S.selected] : null, topic = doc?.topic || null;
+  const units = unitsFor(topic);
+  $('#detailTitle').textContent = topic || '全部文档';
+  $('#detailMeta').textContent = doc ? `${STATUS_TEXT[doc.status] || doc.status} · ${doc.error || '最近状态已同步'}` : '汇总视图';
+  $('#pinBtn').disabled = !doc || S.running; $('#retryBtn').disabled = !doc || S.running;
+  $('#pinBtn').textContent = doc?.pinned ? '◆' : '◇'; $('#pinBtn').title = doc?.pinned ? '取消固定' : '固定文档';
+  renderPipeline(topic);
+  const qa = units.filter(approved), sop = units.filter(u=>u.unit_kind==='sop'), bad = units.filter(failed);
+  $('#qaCount').textContent=qa.length; $('#sopCount').textContent=sop.length; $('#failedCount').textContent=bad.length;
+  const lastError = [...S.errors].reverse().find(error => !topic || error.topic===topic);
+  const banner = $('#errorBanner');
+  if (lastError) { banner.style.display='block'; banner.textContent=`${lastError.topic || '流水线'}：${lastError.data?.message || '未知错误'}`; }
+  else if (doc?.error) { banner.style.display='block'; banner.textContent=doc.error; }
+  else banner.style.display='none';
+  renderUnits({qa,sop,failed:bad}[S.tab] || qa);
+}
+function renderPipeline(topic) {
+  const stages = topic ? (S.stages[topic] || {}) : {};
+  $('#pipeline').innerHTML = STAGES.map(([key,label], index) => {
+    const stage=stages[key]||{}, status=stage.status||'pending';
+    const detail = stage.total ? `${stage.done||0}/${stage.total}` : (stage.attempt ? `第 ${stage.attempt} 次` : stage.detail||'');
+    return `<div class="stage ${esc(status)}" title="${esc(stage.detail||label)}"><div class="stage-node">${status==='done'?'✓':status==='failed'?'!':index+1}</div><div class="stage-name">${esc(label)}</div><div class="stage-detail">${esc(detail)}</div></div>`;
+  }).join('');
+}
+function renderUnits(list) {
+  const query=$('#unitSearch').value.trim().toLowerCase();
+  const filtered=list.filter(unit => !query || JSON.stringify(unit).toLowerCase().includes(query));
+  $('#resultCount').textContent=`${filtered.length} 项`;
+  if (!filtered.length) { $('#unitList').innerHTML='<div class="empty">当前视图没有结果</div>'; return; }
+  $('#unitList').innerHTML=filtered.map(unit => {
+    if (unit.unit_kind==='sop') {
+      const questions=(unit.entry_questions||[]).map(q=>`<span class="chip">${esc(q)}</span>`).join('');
+      return `<article class="unit-row"><div class="unit-top"><div class="unit-title">${esc(unit.title)}</div><span class="chip ok">SOP</span></div><div class="unit-meta">${questions}</div></article>`;
+    }
+    const isFailed=failed(unit), source=unit.sources?.[0];
+    return `<article class="unit-row"><div class="unit-top"><div class="unit-title">${esc(unit.query)}</div><span class="chip ${isFailed?'error':'ok'}">${isFailed?'审核失败':'已批准'}</span></div>
+      <div class="unit-answer">${esc(unit.answer)}</div>
+      ${isFailed?`<div class="reason">${esc(unit.semantic_reason||'未通过审核')}</div>`:''}
+      <div class="unit-meta"><span>重生成 ${unit.review_attempts||0}/1</span>${source?`<span>${esc(source.heading_path||source.doc_title||source.topic)}</span>`:''}${unit.review_history?.length?`<span class="chip warn">初审：${esc(unit.review_history[0])}</span>`:''}</div></article>`;
+  }).join('');
+}
+function renderEvents() {
+  const events=S.events.slice(-120).reverse(); $('#eventCount').textContent=`${events.length} 条`;
+  $('#eventList').innerHTML=events.length ? events.map(event => {
+    const data=event.data||{}, status=data.status||event.kind;
+    const title=event.kind==='stage' ? `${data.stage || 'stage'} · ${status}` : event.kind;
+    const message=data.detail||data.message||(event.kind==='run_status'?`calls ${data.calls||0} · tokens ${fmtNum(data.total_tokens)}`:'');
+    return `<div class="event ${esc(status)}"><div class="event-top"><i class="event-kind"></i><span class="event-topic">${esc(event.topic||title)}</span><span class="event-time">${fmtTime(event.ts)}</span></div><div class="event-message">${esc(event.topic?title+(message?' · '+message:''):message||title)}</div></div>`;
+  }).join('') : '<div class="empty">暂无事件</div>';
 }
 
-// events
-$('#docs').addEventListener('click', e=>{
-  const act=e.target.dataset.act, topic=e.target.dataset.topic;
-  if(act==='pin'){ const cur=S.docs[topic]&&S.docs[topic].pinned; api('/api/pin',{topic,pinned:!cur}); e.stopPropagation(); return; }
-  if(act==='retry'){ api('/api/retry',{topics:[topic]}); e.stopPropagation(); return; }
-  const card=e.target.closest('.doc'); if(card){ S.sel = S.sel===card.dataset.topic?null:card.dataset.topic; renderDocs(); renderUnits(); }
-});
-$('#runAll').onclick=()=>api('/api/run',{});
-$('#exportBtn').onclick=()=>api('/api/export',{});
-$('#q').addEventListener('input', renderUnits);
+$('#docSearch').addEventListener('input',renderDocs);
+$('#unitSearch').addEventListener('input',renderDetail);
+$('#docList').addEventListener('click',event=>{ const row=event.target.closest('[data-topic]'); if(row){S.selected=row.dataset.topic;render();} });
+$('#tabs').addEventListener('click',event=>{ const tab=event.target.closest('[data-tab]'); if(!tab)return; S.tab=tab.dataset.tab; document.querySelectorAll('.tab').forEach(node=>node.classList.toggle('active',node===tab)); renderDetail(); });
+$('#runBtn').addEventListener('click',async()=>{ try{await api('/api/run',{});S.running=true;renderHeader();toast('流水线已启动');}catch(_){} });
+$('#exportBtn').addEventListener('click',async()=>{ try{const data=await api('/api/export',{});toast(`已导出 ${data.stats?.qa_units||0} 条 QA`);}catch(_){} });
+$('#retryBtn').addEventListener('click',async()=>{ if(!S.selected)return;try{await api('/api/retry',{topics:[S.selected]});S.running=true;renderHeader();toast(`已重试 ${S.selected}`);}catch(_){} });
+$('#pinBtn').addEventListener('click',async()=>{ const doc=S.docs[S.selected];if(!doc)return;try{await api('/api/pin',{topic:doc.topic,pinned:!doc.pinned});doc.pinned=!doc.pinned;render();}catch(_){} });
 
-const es=new EventSource('/api/events');
-es.onmessage=e=>{ try{ onEvent(JSON.parse(e.data)); }catch(_){} };
-refreshState();
+let eventSource;
+function connectEvents() {
+  eventSource?.close(); eventSource=new EventSource('/api/events');
+  eventSource.onopen=()=>setConnection('online','实时同步');
+  eventSource.onmessage=message=>{try{onEvent(JSON.parse(message.data));}catch(error){console.error(error);}};
+  eventSource.onerror=()=>setConnection('offline','连接中断，正在重连');
+}
+
+(async function boot(){ await refreshState(); connectEvents(); setInterval(()=>refreshState(true),15000); document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshState(true);}); })();
 </script>
 </body>
 </html>

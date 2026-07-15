@@ -38,6 +38,7 @@ from ragkb.pipeline.extract import extract_qa, extract_qa_sections, extract_sop
 from ragkb.pipeline.gate_semantic import review_qa
 from ragkb.pipeline.gate_struct import gate_qa, gate_sop
 from ragkb.pipeline.paraphrase import add_paraphrases_batch
+from ragkb.pipeline.regenerate import review_with_regeneration
 from ragkb.pipeline.sections import split_oversize_sections
 from ragkb.pipeline.units import QAUnit, SOPUnit
 from ragkb.pipeline.vision import vision_read_image
@@ -99,13 +100,14 @@ class Orchestrator:
             log.warning("cannot load previous results: %s", exc)
             return
         for unit in qa:
-            unit.semantic_ok = True
+            if not self.settings.enable_paraphrases:
+                unit.paraphrases = []
             topic = unit.sources[0].topic if unit.sources else ""
             self._results.setdefault(topic, DocResult(topic=topic)).qa.append(unit)
         for unit in sop:
             topic = unit.sources[0].topic if unit.sources else ""
             self._results.setdefault(topic, DocResult(topic=topic)).sop.append(unit)
-        self._consolidated_qa = qa
+        self._consolidated_qa = [u for u in qa if u.semantic_ok]
 
     # ---- per-document pipeline -------------------------------------------
     def _process_doc(self, md_path: Path, topic: str | None = None) -> DocResult:
@@ -113,24 +115,39 @@ class Orchestrator:
         self.bus.publish("doc_status", topic, status="running")
         self.manifest.update(topic, status="running", error="")
         try:
+            self.bus.publish("stage", topic, stage="parse", status="running")
             doc = parse_document(md_path, topic=topic)
             self.manifest.update(topic, source_sha=doc.source_sha)
+            self.bus.publish("stage", topic, stage="parse", status="done",
+                             detail=f"{sum(1 for _ in doc.iter_sections())} sections")
             # 1. Vision-read every image (replaces weak inline OCR).
             imgs = doc.all_images()
+            self.bus.publish("stage", topic, stage="vision", status="running",
+                             done=0, total=len(imgs))
             for k, im in enumerate(imgs):
                 vision_read_image(im, self.llm, self.cache)
                 self.bus.publish("doc_progress", topic, stage="vision",
                                  done=k + 1, total=len(imgs))
+                self.bus.publish("stage", topic, stage="vision", status="running",
+                                 done=k + 1, total=len(imgs))
+            self.bus.publish("stage", topic, stage="vision", status="done",
+                             done=len(imgs), total=len(imgs))
             # 2. Classify sections.
             secs = split_oversize_sections(
                 [s for s in doc.iter_sections() if s.body.strip() or s.images])
+            self.bus.publish("stage", topic, stage="classify", status="running",
+                             done=0, total=len(secs))
             labels = classify_sections(secs, self.llm)
+            self.bus.publish("stage", topic, stage="classify", status="done",
+                             done=len(secs), total=len(secs))
             # 3. Extract with size-aware batches. Documents are the concurrency
             #    boundary, so there is no nested pool multiplying gateway pressure.
             sop: list[SOPUnit] = []
             qa_secs = [s for s in secs if labels.get(s.sid, "qa") == "qa"]
             sop_secs = [s for s in secs if labels.get(s.sid, "qa") == "sop"]
             total = len(qa_secs) + len(sop_secs)
+            self.bus.publish("stage", topic, stage="extract", status="running",
+                             done=0, total=total)
             qa = extract_qa_sections(doc, qa_secs, self.llm, cache=self.cache)
             self.bus.publish("doc_progress", topic, stage="extract",
                              done=len(qa_secs), total=total)
@@ -140,16 +157,22 @@ class Orchestrator:
                     sop.append(unit)
                 self.bus.publish("doc_progress", topic, stage="extract",
                                  done=done, total=total)
+            self.bus.publish("stage", topic, stage="extract", status="done",
+                             done=total, total=total,
+                             detail=f"{len(qa)} QA / {len(sop)} SOP")
             # 4. Layer 1 structural gate (retry truncated once with more tokens).
+            self.bus.publish("stage", topic, stage="validate", status="running")
             for u in qa:
                 gate_qa(u)
             for u in sop:
                 gate_sop(u)
             qa = self._retry_truncated_qa(doc, secs, labels, qa)
             sop = self._retry_truncated_sop(doc, secs, sop)
-            # 5. Paraphrase (recall boost) in cheap Flash batches.
+            self.bus.publish("stage", topic, stage="validate", status="done",
+                             detail=f"{sum(u.struct_ok for u in qa)} QA valid")
+            # Optional experiment only; the production path remains source-faithful.
             ok_units = [u for u in qa if u.struct_ok]
-            if ok_units:
+            if self.settings.enable_paraphrases and ok_units:
                 add_paraphrases_batch(ok_units, self.llm, self.cache)
             res = DocResult(topic=topic, qa=qa, sop=sop)
             self._publish_units(topic, qa, sop)
@@ -158,6 +181,8 @@ class Orchestrator:
             log.exception("doc %s failed", topic)
             self.bus.publish("error", topic, message=str(exc))
             self.manifest.update(topic, status="failed", error=str(exc))
+            self.bus.publish("stage", topic, stage="failed", status="failed",
+                             detail=str(exc))
             with self._lock:
                 self._failed_this_run.add(topic)
             return DocResult(topic=topic, error=str(exc))
@@ -281,14 +306,24 @@ class Orchestrator:
         all_qa: list[QAUnit] = []
         for res in self._results.values():
             all_qa.extend([u for u in res.qa if u.struct_ok])
-        # Cross-file aggregate (by topic), then review only new/changed units.
+        # Cross-file aggregate, review, one source-grounded regeneration, re-review.
         aggregated = aggregate_by_topic(all_qa)
         pending_review = [u for u in aggregated if u.semantic_ok is None]
         self.bus.publish("log", message=f"aggregated {len(all_qa)}→{len(aggregated)} QA; "
                                         f"reviewing {len(pending_review)} changed units")
-        review_qa(pending_review, self.llm, policy=self.settings.semantic_gate_policy,
-                  model=self.settings.reviewer_model or None)
+        def _review_stage(unit, stage, status, detail):
+            topic = unit.sources[0].topic if unit.sources else ""
+            self.bus.publish("stage", topic, stage=stage, status=status,
+                             attempt=unit.review_attempts, detail=detail)
+
+        review_with_regeneration(
+            pending_review, self.llm,
+            max_attempts=self.settings.review_regeneration_attempts,
+            reviewer_model=self.settings.reviewer_model or None,
+            on_stage=_review_stage)
+
         survivors = [u for u in aggregated if u.semantic_ok]
+        failed_review = [u for u in aggregated if not u.semantic_ok]
         rejected_by_topic: dict[str, int] = {}
         for unit in aggregated:
             if unit.semantic_ok:
@@ -303,13 +338,17 @@ class Orchestrator:
         for u in deduped:
             topic = u.sources[0].topic if u.sources else ""
             by_topic.setdefault(topic, []).append(u)
+        for u in failed_review:
+            topic = u.sources[0].topic if u.sources else ""
+            by_topic.setdefault(topic, []).append(u)
         for topic, res in self._results.items():
             res.qa = by_topic.get(topic, [])
             if topic in self._failed_this_run:
                 continue
             self.manifest.update(
                 topic, status="done",
-                extracted=len(res.qa), passed=len(res.qa),
+                extracted=len(res.qa),
+                passed=sum(1 for u in res.qa if u.publication_status == "approved"),
                 rejected=rejected_by_topic.get(topic, 0),
                 needs_review=sum(1 for u in res.qa if u.needs_review),
                 sop_count=len(res.sop))
@@ -330,7 +369,7 @@ class Orchestrator:
                 # module's distinct answer here, diverging results.json from the
                 # exported set.
                 mod = u.sources[0].topic if u.sources else ""
-                key = (mod, u.unit_id)
+                key = (mod, u.publication_status, u.unit_id)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -340,6 +379,9 @@ class Orchestrator:
                     "needs_review": u.needs_review,
                     "semantic_reason": u.semantic_reason,
                     "semantic_ok": u.semantic_ok,
+                    "review_attempts": u.review_attempts,
+                    "publication_status": u.publication_status,
+                    "review_history": u.review_history,
                     "sources": [s.to_dict(include_excerpt=True) for s in u.sources]})
             for u in res.sop:
                 payload["sop"].append({
@@ -369,7 +411,7 @@ class Orchestrator:
                         seen.add(u.unit_id)
                         qa.append(u)
         sop = [u for res in self._results.values() for u in res.sop if u.struct_ok]
-        stats = export_all(qa, sop, self.settings.output_dir)
+        stats = export_all(qa, sop, self.settings.output_dir, include_paraphrases=False)
         self.bus.publish("run_status", status="exported",
                          qa_units=stats.qa_units, qa_rows=stats.qa_rows,
                          sop_files=stats.sop_files, needs_review=stats.needs_review)

@@ -15,6 +15,7 @@ background thread so the SSE stream and control endpoints stay responsive.
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 from pathlib import Path
@@ -28,6 +29,7 @@ from ragkb.pipeline.events import EventBus
 from ragkb.pipeline.orchestrator import Orchestrator
 
 _WEB_DIR = Path(__file__).parent / "web"
+log = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
@@ -42,6 +44,9 @@ def create_app() -> FastAPI:
         """Execute a run after the API handler atomically reserved the slot."""
         try:
             orch.run(only=only, force=force)
+        except Exception as exc:  # surface background failures through SSE/state
+            log.exception("pipeline run failed")
+            bus.publish("run_status", status="failed", message=str(exc))
         finally:
             with run_lock:
                 state["running"] = False
@@ -66,17 +71,40 @@ def create_app() -> FastAPI:
         results = {}
         if results_path.is_file():
             try:
-                results = json.loads(results_path.read_text("utf-8"))
+                results = _public_results(json.loads(results_path.read_text("utf-8")))
             except (json.JSONDecodeError, ValueError):
                 results = {}
-        return JSONResponse({"docs": docs, "results": results,
-                             "running": state["running"]})
+        history = bus.history()
+        stages: dict[str, dict[str, dict]] = {}
+        errors = []
+        last_run = {}
+        for event in history:
+            if event.kind == "stage" and event.topic:
+                stages.setdefault(event.topic, {})[event.data.get("stage", "unknown")] = {
+                    **event.data, "seq": event.seq, "ts": event.ts}
+            elif event.kind == "error":
+                errors.append(event.to_dict())
+            elif event.kind == "run_status":
+                last_run = {**event.data, "seq": event.seq, "ts": event.ts}
+        llm_settings = orch.llm.settings
+        usage = orch.llm.total_usage
+        return JSONResponse({
+            "docs": docs, "results": results, "running": state["running"],
+            "stages": stages, "errors": errors[-50:], "last_run": last_run,
+            "events": [event.to_dict() for event in history[-300:]],
+            "usage": usage.__dict__,
+            "models": {
+                "classify": llm_settings.model_for("classify"),
+                "extract": llm_settings.model_for("extract"),
+                "review": llm_settings.model_for("review"),
+            },
+        })
 
     @app.get("/api/events")
     async def api_events(request: Request):
         q = bus.subscribe()
         # Replay recent history so a late browser catches up.
-        backlog = [ev.to_dict() for ev in bus.history()[-200:]]
+        backlog = [ev.to_dict() for ev in bus.history()[-300:]]
 
         async def gen():
             try:
@@ -138,6 +166,19 @@ async def _json(request: Request) -> dict:
         return await request.json()
     except (json.JSONDecodeError, ValueError):
         return {}
+
+
+def _public_results(data: dict) -> dict:
+    """Remove large source evidence while retaining traceable source metadata."""
+    clean = {"qa": [], "sop": []}
+    for kind in clean:
+        for item in data.get(kind, []) or []:
+            row = dict(item)
+            row["sources"] = [
+                {key: value for key, value in source.items() if key != "source_excerpt"}
+                for source in item.get("sources", [])]
+            clean[kind].append(row)
+    return clean
 
 
 app = create_app()

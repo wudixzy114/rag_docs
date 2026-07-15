@@ -53,24 +53,24 @@ def run(only: list[str] = typer.Option(None, "--only", help="只处理指定主�
 
 
 @app.command()
-def export(no_paraphrase: bool = typer.Option(
-        False, "--no-paraphrase",
-        help="额外导出无扩写版(每答案仅主query一行): qa_pairs_no_paraphrase.csv + 知识库上传包_无扩写.zip")):
+def export(with_paraphrase: bool = typer.Option(
+        False, "--with-paraphrase",
+        help="额外导出实验性扩写版；默认主产物仅包含原始主问题")):
     """Regenerate CSV/SOP/metadata/zip from the last run's results.json.
 
     Reproducible outside the producing process: rehydrates consolidated units
     (and the redaction map) from output/, then re-exports. Use this after hand-
     editing results.json, or to re-run export with updated packaging logic.
 
-    --no-paraphrase writes the SLIM variant to SEPARATE filenames (the default
-    inflated artifacts are left untouched), for a vector DB that does not dedup by
-    answer at retrieval time."""
+    `--with-paraphrase` writes a separate experimental artifact; the default
+    production artifact contains only the source-faithful primary query."""
     settings = get_settings()
     from ragkb.pipeline.export import export_all, load_results
     qa, sop = load_results(settings.output_dir)
+    qa = [u for u in qa if u.publication_status == "approved" and u.semantic_ok]
     stats = export_all(qa, sop, settings.output_dir,
-                       include_paraphrases=not no_paraphrase)
-    variant = "无扩写" if no_paraphrase else "含扩写"
+                       include_paraphrases=with_paraphrase)
+    variant = "含扩写实验版" if with_paraphrase else "忠实原文主版本"
     typer.echo(
         f"已导出（{variant}）：QA单元 {stats.qa_units}，检索行 {stats.qa_rows}，"
         f"SOP {stats.sop_files}，待复核 {stats.needs_review}，模块 {stats.modules}")

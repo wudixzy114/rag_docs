@@ -14,6 +14,7 @@ from ragkb.parse.source import load_source, source_bundle_sha
 from ragkb.pipeline.batching import pack_by_size
 from ragkb.pipeline.gate_semantic import review_qa
 from ragkb.pipeline.extract import extract_qa
+from ragkb.pipeline.regenerate import review_with_regeneration
 from ragkb.pipeline.orchestrator import discover_topics
 from ragkb.pipeline.sections import split_oversize_sections
 from ragkb.pipeline.units import Provenance, QAUnit
@@ -104,7 +105,7 @@ class _ReviewLLM:
                                '"revised_answer":"按原文执行完整步骤"}]')
 
 
-def test_review_repairs_missing_ids_and_applies_revision():
+def test_review_repairs_missing_ids_and_routes_revision_to_regeneration():
     source = Provenance(heading_path="章节", source_excerpt="原始证据：按原文执行完整步骤")
     units = [QAUnit(query="问题一", answer="答案一", paraphrases=["安全问法", "新增场景"],
                     sources=[source]),
@@ -115,8 +116,9 @@ def test_review_repairs_missing_ids_and_applies_revision():
     assert "原始证据" in llm.calls[0]
     assert units[0].semantic_ok is True
     assert units[0].paraphrases == ["安全问法"]
-    assert units[1].semantic_ok is True
-    assert units[1].answer == "按原文执行完整步骤"
+    assert units[1].semantic_ok is False
+    assert units[1].publication_status == "failed_review"
+    assert units[1].answer == "不完整"
 
 
 class _MissingRevisionLLM:
@@ -130,7 +132,44 @@ def test_review_rejects_revise_without_actual_revision():
                   sources=[Provenance(source_excerpt="原文")])
     review_qa([unit], _MissingRevisionLLM())
     assert unit.semantic_ok is False
-    assert "missing_revision" in unit.semantic_reason
+    assert unit.semantic_reason == "revise:需要修改"
+
+
+class _ReviewRegenerateLLM:
+    def __init__(self, final_verdict="pass"):
+        self.review_calls = 0
+        self.final_verdict = final_verdict
+
+    def complete(self, **kwargs):
+        if "问答修复专家" in kwargs["system"]:
+            return LLMResult(text='[{"id":0,"query":"如何完整处理？",'
+                                   '"answer":"第一步执行 A，第二步执行 B。"}]')
+        self.review_calls += 1
+        verdict = "reject" if self.review_calls == 1 else self.final_verdict
+        return LLMResult(text=f'[{{"id":0,"verdict":"{verdict}",'
+                               '"reason":"check","valid_paraphrases":[]}]')
+
+
+def test_review_regenerates_once_then_approves():
+    unit = QAUnit(query="怎么做？", answer="只执行 A",
+                  sources=[Provenance(topic="t", source_excerpt="第一步执行 A，第二步执行 B。")])
+    review_with_regeneration([unit], _ReviewRegenerateLLM(), max_attempts=1)
+    assert unit.semantic_ok is True
+    assert unit.publication_status == "approved"
+    assert unit.review_attempts == 1
+    assert unit.review_history == ["reject:check"]
+    assert "第二步" in unit.answer
+
+
+def test_review_failure_after_one_regeneration_is_retained_and_marked():
+    unit = QAUnit(query="怎么做？", answer="只执行 A",
+                  sources=[Provenance(topic="t", source_excerpt="第一步执行 A，第二步执行 B。")])
+    review_with_regeneration(
+        [unit], _ReviewRegenerateLLM(final_verdict="reject"), max_attempts=1)
+    assert unit.semantic_ok is False
+    assert unit.publication_status == "failed_review"
+    assert unit.needs_review is True
+    assert unit.review_attempts == 1
 
 
 class _InvalidJSONLLM:
