@@ -1,10 +1,25 @@
-.venv/
+# --- Python ---
 __pycache__/
-*.pyc
-output/.cache/
-.env
-知识库配对素材.zip
-input/
-.DS_Store
+*.py[cod]
+*.egg-info/
+.pytest_cache/
 
+# --- 虚拟环境 ---
+.venv/
+venv/
+
+# --- 构建产物 (hatchling) ---
+/build/
+/dist/
+
+# --- 密钥 / 环境变量 ---
+.env
+.env.*
+
+# --- 运行时输入与产物 (不入库) ---
+input/
 output/
+知识库配对素材.zip
+
+# --- 操作系统 ---
+.DS_Store
