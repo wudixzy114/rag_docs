@@ -199,6 +199,16 @@ def test_sop_filename_fallback_and_collision(tmp_path):
     assert "06_批调度__1.md" in names and "06_批调度__1-2.md" in names
 
 
+def test_export_removes_stale_generated_sop(tmp_path):
+    unit = SOPUnit(title="1. 旧流程", markdown="# 旧流程\n步骤",
+                   entry_questions=["怎么做"], sources=[Provenance(topic="模块")])
+    export_all([], [unit], tmp_path)
+    stale = tmp_path / "sop" / "模块__1.md"
+    assert stale.is_file()
+    export_all([], [], tmp_path)
+    assert not stale.exists()
+
+
 def test_upload_zip_utf8_and_no_dsstore(tmp_path):
     """The zip must set the UTF-8 filename flag on CJK names (else mojibake on
     unzip) and never bundle .DS_Store."""

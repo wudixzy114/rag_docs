@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from typing import Any
 class Cache:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
+        self._write_lock = threading.Lock()
 
     def _path(self, namespace: str, key: str) -> Path:
         safe = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
@@ -34,10 +36,11 @@ class Cache:
 
     def put(self, namespace: str, key: str, value: Any) -> None:
         p = self._path(namespace, key)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(value, ensure_ascii=False, indent=0), "utf-8")
-        tmp.replace(p)          # atomic: a crash mid-write never leaves a half file
+        with self._write_lock:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(value, ensure_ascii=False, indent=0), "utf-8")
+            tmp.replace(p)      # atomic: a crash mid-write never leaves a half file
 
     def has(self, namespace: str, key: str) -> bool:
         return self._path(namespace, key).is_file()

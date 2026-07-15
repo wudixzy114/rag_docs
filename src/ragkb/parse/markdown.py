@@ -17,11 +17,11 @@ correctness-critical behaviors, both grounded in the real material:
 """
 from __future__ import annotations
 
-import hashlib
 import re
 from pathlib import Path
 
 from ragkb.parse.model import Document, Image, Section
+from ragkb.parse.source import load_source, source_bundle_sha
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
@@ -30,12 +30,14 @@ _OCR_SOURCE_RE = re.compile(r"<!--\s*ocr-source:\s*(.+?)\s*-->")
 
 
 def parse_document(md_path: Path, topic: str | None = None) -> Document:
-    """Parse a markdown file into a Document. `topic` defaults to the parent
-    folder name (the aggregation boundary)."""
+    """Parse any supported source into a section tree.
+
+    Non-Markdown inputs are first converted to a conservative Markdown-like
+    representation. `topic` defaults to the parent folder for compatibility.
+    """
     md_path = Path(md_path)
-    raw = md_path.read_bytes()
-    text = raw.decode("utf-8")
-    source_sha = hashlib.sha256(raw).hexdigest()
+    text = load_source(md_path)
+    source_sha = source_bundle_sha(md_path)
     topic = topic or md_path.parent.name
     base_dir = md_path.parent
 
@@ -122,7 +124,19 @@ def parse_document(md_path: Path, topic: str | None = None) -> Document:
 
     flush_body(stack[-1])
 
-    title = root.children[0].title if root.children and root.children[0].level == 1 else topic
+    # Keep pre-heading prose and fully unstructured documents. Previously this
+    # content lived on the synthetic root and was invisible to iter_sections(),
+    # silently dropping headerless notes and document introductions.
+    if root.body.strip() or root.images:
+        intro_title = md_path.stem if not root.children else f"{md_path.stem}（前言）"
+        intro = Section(level=1, title=intro_title, body=root.body,
+                        images=root.images, sid="0")
+        root.body = ""
+        root.images = []
+        root.children.insert(0, intro)
+
+    title = next((s.title for s in root.children if s.level == 1 and s.sid != "0"),
+                 root.children[0].title if root.children else (md_path.stem or topic))
     return Document(path=md_path, topic=topic, title=title, root=root, source_sha=source_sha)
 
 

@@ -15,8 +15,9 @@ from ragkb.parse.model import Document, Section
 from ragkb.pipeline.jsonutil import parse_json_array, parse_json_object
 from ragkb.pipeline.prompts import (
     EXTRACT_SYSTEM, SOP_SYSTEM, EXTRACT_VERSION, SOP_VERSION,
-    build_extract_user, build_sop_user, build_images_block,
+    build_extract_user, build_batch_extract_user, build_sop_user, build_images_block,
 )
+from ragkb.pipeline.batching import pack_by_size
 from ragkb.pipeline.scrub import mask
 from ragkb.pipeline.units import Provenance, QAUnit, SOPUnit
 from ragkb.store.cache import key_for
@@ -25,6 +26,8 @@ log = logging.getLogger(__name__)
 
 _EXTRACT_MAX_TOKENS = 4096
 _SOP_MAX_TOKENS = 6144
+_BATCH_MAX_ITEMS = 8
+_BATCH_MAX_CHARS = 18000
 
 
 def _section_images(sec: Section) -> list[dict]:
@@ -39,16 +42,24 @@ def _section_images(sec: Section) -> list[dict]:
 
 
 def _provenance(doc: Document, sec: Section) -> Provenance:
+    evidence = mask(sec.body)
+    image_text = "\n\n".join(
+        f"[图片 {im.rel_path}]\n{mask(im.vision_text or im.inline_ocr)}"
+        for im in sec.images if (im.vision_text or im.inline_ocr).strip())
+    if image_text:
+        evidence = f"{evidence}\n\n{image_text}".strip()
     return Provenance(
         topic=doc.topic, doc_title=doc.title,
         heading_path=sec.full_title, section_sid=sec.sid,
         source_sha=doc.source_sha,
         image_refs=[im.rel_path for im in sec.images],
+        source_excerpt=evidence[:16000],
     )
 
 
 def extract_qa(doc: Document, sec: Section, llm: LLMClient,
-               model: str | None = None, cache=None) -> list[QAUnit]:
+               model: str | None = None, cache=None,
+               max_tokens: int = _EXTRACT_MAX_TOKENS) -> list[QAUnit]:
     """Extract QA pairs from a section. Truncation (finish_reason==length) is
     recorded on every unit so the struct gate can fail them and the orchestrator
     can retry with a larger budget. Cached by (section content + prompt version)
@@ -65,12 +76,13 @@ def extract_qa(doc: Document, sec: Section, llm: LLMClient,
             return [_qa_from_dict(d, prov) for d in hit]
     try:
         r = llm.complete(system=EXTRACT_SYSTEM, user=user,
-                         max_tokens=_EXTRACT_MAX_TOKENS, task="extract", model=model)
+                         max_tokens=max_tokens, task="extract", model=model)
     except LLMError as exc:
-        log.warning("extract_qa failed [%s %s]: %s", doc.topic, sec.sid, exc)
-        return []
+        raise LLMError(f"extract_qa failed [{doc.topic} {sec.sid}]: {exc}") from exc
     truncated = r.finish_reason == "length"
-    arr = parse_json_array(r.text) or []
+    arr = parse_json_array(r.text)
+    if arr is None:
+        raise LLMError(f"extract_qa returned invalid JSON [{doc.topic} {sec.sid}]")
     units: list[QAUnit] = []
     raw: list[dict] = []
     for el in arr:
@@ -87,13 +99,72 @@ def extract_qa(doc: Document, sec: Section, llm: LLMClient,
     return units
 
 
+def extract_qa_sections(doc: Document, sections: list[Section], llm: LLMClient,
+                        cache=None) -> list[QAUnit]:
+    """Cache-aware, size-bounded extraction for multiple independent sections."""
+    output: list[QAUnit] = []
+    pending: list[tuple[Section, str, str | None]] = []
+    for sec in sections:
+        user = build_extract_user(sec.full_title, sec.title, mask(sec.body),
+                                  build_images_block(_section_images(sec)))
+        ck = key_for(_content_sha(user), "task:extract", EXTRACT_VERSION) if cache else None
+        hit = cache.get("extract", ck) if cache and ck else None
+        if hit is not None:
+            prov = _provenance(doc, sec)
+            output.extend(_qa_from_dict(d, prov) for d in hit)
+        else:
+            pending.append((sec, user, ck))
+
+    for batch in pack_by_size(pending, lambda item: len(item[1]),
+                              max_items=_BATCH_MAX_ITEMS, max_chars=_BATCH_MAX_CHARS):
+        payload = [{"id": sec.sid, "heading_path": sec.full_title, "content": user}
+                   for sec, user, _ in batch]
+        parsed: dict[str, list[dict]] = {}
+        truncated = False
+        try:
+            result = llm.complete(system=EXTRACT_SYSTEM,
+                                  user=build_batch_extract_user(payload),
+                                  max_tokens=_EXTRACT_MAX_TOKENS, task="extract")
+            truncated = result.finish_reason == "length"
+            for row in parse_json_array(result.text) or []:
+                if not isinstance(row, dict) or "id" not in row:
+                    continue
+                items = row.get("items", [])
+                if isinstance(items, list):
+                    parsed[str(row["id"])] = [x for x in items if isinstance(x, dict)]
+        except LLMError as exc:
+            log.warning("batch extraction failed [%s, %d sections]: %s",
+                        doc.topic, len(batch), exc)
+
+        for sec, _user, ck in batch:
+            rows = parsed.get(sec.sid)
+            if rows is None or truncated:
+                output.extend(extract_qa(
+                    doc, sec, llm, cache=cache,
+                    max_tokens=8192 if truncated else _EXTRACT_MAX_TOKENS))
+                continue
+            prov = _provenance(doc, sec)
+            clean: list[dict] = []
+            for row in rows:
+                q = str(row.get("query", "")).strip()
+                a = str(row.get("answer", "")).strip()
+                if not q and not a:
+                    continue
+                clean.append({"query": q, "answer": a, "truncated": False})
+                output.append(QAUnit(query=q, answer=a, sources=[prov]))
+            if cache is not None and ck:
+                cache.put("extract", ck, clean)
+    return output
+
+
 def _qa_from_dict(d: dict, prov: Provenance) -> QAUnit:
     return QAUnit(query=d.get("query", ""), answer=d.get("answer", ""),
                   sources=[prov], truncated=bool(d.get("truncated", False)))
 
 
 def extract_sop(doc: Document, sec: Section, llm: LLMClient,
-                model: str | None = None, cache=None) -> SOPUnit | None:
+                model: str | None = None, cache=None,
+                max_tokens: int = _SOP_MAX_TOKENS) -> SOPUnit | None:
     """Clean a section into a whole-Markdown SOP + entry questions. Cached by
     (section content + prompt version) so a re-run skips done sections."""
     images = _section_images(sec)
@@ -110,12 +181,13 @@ def extract_sop(doc: Document, sec: Section, llm: LLMClient,
                            sources=[prov], truncated=False) if hit.get("markdown") else None
     try:
         r = llm.complete(system=SOP_SYSTEM, user=user,
-                         max_tokens=_SOP_MAX_TOKENS, task="sop", model=model)
+                         max_tokens=max_tokens, task="sop", model=model)
     except LLMError as exc:
-        log.warning("extract_sop failed [%s %s]: %s", doc.topic, sec.sid, exc)
-        return None
+        raise LLMError(f"extract_sop failed [{doc.topic} {sec.sid}]: {exc}") from exc
     truncated = r.finish_reason == "length"
-    obj = parse_json_object(r.text) or {}
+    obj = parse_json_object(r.text)
+    if obj is None:
+        raise LLMError(f"extract_sop returned invalid JSON [{doc.topic} {sec.sid}]")
     md = str(obj.get("markdown", "")).strip()
     eqs = [str(q).strip() for q in obj.get("entry_questions", []) if str(q).strip()]
     if not md:

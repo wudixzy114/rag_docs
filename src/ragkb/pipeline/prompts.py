@@ -76,7 +76,7 @@ def build_classify_user(sections: list[dict]) -> str:
 
 
 # -------------------------------------------------------------- extract -----
-EXTRACT_VERSION = "v1"
+EXTRACT_VERSION = "v2"
 
 EXTRACT_SYSTEM = """你是诊断知识库的问答抽取专家。你的产出将直接进入生产环境的向量库，\
 供一线用户检索。质量要求（工业级）：
@@ -116,6 +116,22 @@ def build_extract_user(heading_path: str, title: str, body: str,
     return EXTRACT_USER.format(heading_path=heading_path or "（无）", title=title,
                                body=body or "（无正文）",
                                images_block=images_block or "（本小节无图片）")
+
+
+BATCH_EXTRACT_USER = """一次处理下列多个互相独立的小节，以减少调用成本。不得跨小节混合事实。
+
+返回 JSON 数组，必须覆盖每个 id：
+[{{"id":"<原 id>","items":[{{"query":"<问题>","answer":"<忠于该小节的完整回答>"}}]}}]
+无法产出问答的小节也要返回 {{"id":"<原 id>","items":[]}}。
+
+小节：
+{sections}"""
+
+
+def build_batch_extract_user(sections: list[dict]) -> str:
+    import json
+    return BATCH_EXTRACT_USER.format(
+        sections=json.dumps(sections, ensure_ascii=False, separators=(",", ":")))
 
 
 # ------------------------------------------------------------------ sop -----
@@ -177,7 +193,7 @@ def _indent(text: str, n: int) -> str:
 
 
 # ----------------------------------------------------------- review (L2) -----
-REVIEW_VERSION = "v1"
+REVIEW_VERSION = "v2"
 
 REVIEW_SYSTEM = """你是诊断知识库的质量审核专家，用独立、挑剔的眼光审查已抽取的问答对是否\
 达到生产标准。你不是来挑语法毛病的，而是判断这条问答能否安全地交给一线用户使用。
@@ -187,6 +203,8 @@ REVIEW_SYSTEM = """你是诊断知识库的质量审核专家，用独立、挑�
 2. 明确性：有无"可能""也许""检查一下相关设置"这类模糊、不可执行的表述。
 3. 完整性：answer 是否自成一体、步骤/命令完整，没有被截断或缺关键步骤。
 4. 相关性：query 和 answer 是否匹配，query 是否是真实用户会问的问题。
+5. 扩写问法：逐条检查问法变体是否与主 query 意图完全一致；引入原文没有的新故障场景、
+   前提或结论的变体必须排除。
 
 判定 verdict：
 - "pass"：达到生产标准，可直接使用。
@@ -198,7 +216,10 @@ REVIEW_SYSTEM = """你是诊断知识库的质量审核专家，用独立、挑�
 REVIEW_USER = """审核下列问答对。每条给出 id、query、answer，以及抽取时依据的原始材料。
 
 返回 JSON 数组，每个元素：
-{{"id": <数字>, "verdict": "pass|revise|reject", "reason": "<不超过40字>"}}
+{{"id": <数字>, "verdict": "pass|revise|reject", "reason": "<不超过40字>",
+  "revised_query": "<仅需修订主问题时填写>",
+  "revised_answer": "<需修订回答时填写；基于原始材料给出可直接发布的完整答案>",
+  "valid_paraphrases": ["<从输入问法变体中逐字复制审核通过的项；不得新增>"]}}
 必须覆盖所有 id。
 
 {items}"""
@@ -207,17 +228,18 @@ REVIEW_USER = """审核下列问答对。每条给出 id、query、answer，以�
 def build_review_user(items: list[dict]) -> str:
     blocks = []
     for it in items:
-        src = (it.get("source") or "").strip()[:1500]
+        src = (it.get("source") or "").strip()[:6000]
         blocks.append(
             f'--- id={it["id"]}\n'
             f'query: {it["query"]}\n'
             f'answer: {it["answer"]}\n'
+            f'问法变体: {it.get("paraphrases", [])}\n'
             f'原始材料:\n{src}')
     return REVIEW_USER.format(items="\n\n".join(blocks))
 
 
 # ------------------------------------------------------- paraphrase keys -----
-PARAPHRASE_VERSION = "v1"
+PARAPHRASE_VERSION = "v2"
 
 PARAPHRASE_SYSTEM = """你是检索优化助手。给定一个标准问题，生成若干"用户可能会用的其他问法"，\
 用于扩大向量检索的命中面。要求：
@@ -240,3 +262,11 @@ PARAPHRASE_USER = """为下面的问题生成 {n} 条不同的用户问法（不
 def build_paraphrase_user(query: str, answer: str, n: int = 4) -> str:
     return PARAPHRASE_USER.format(n=n, query=query,
                                   answer_hint=(answer or "")[:200])
+
+
+def build_batch_paraphrase_user(items: list[dict], n: int) -> str:
+    import json
+    return (f"为每条问答生成最多 {n} 个自然且语义等价的用户问法。"
+            "只输出 JSON 数组并覆盖所有 id，格式："
+            '[{"id":0,"variants":["问法1","问法2"]}]。\n数据：'
+            + json.dumps(items, ensure_ascii=False, separators=(",", ":")))

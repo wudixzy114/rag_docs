@@ -13,11 +13,9 @@ Observability: every state change publishes an Event (picked up by the dashboard
 SSE stream). Idempotency: the manifest skips pinned/unchanged docs. Retry: run(
 only=[topics]) re-processes just those; a pinned doc is never overwritten.
 
-Concurrency note: the vendored LLMClient is thread-safe (thread-local active
-model), so one shared client is used across workers. The single global ceiling is
-settings.max_workers (extraction pool) — the semantic gate's internal pool is
-small and runs after extraction, so they don't compound catastrophically; keep
-max_workers modest per the gateway rate limit.
+Concurrency note: documents are the only executor boundary. One thread-safe
+client applies a second global semaphore to every network call, so document
+parallelism, retries and later stages cannot multiply into nested request bursts.
 """
 from __future__ import annotations
 
@@ -31,15 +29,16 @@ from pathlib import Path
 from ragkb.config import Settings, get_settings
 from ragkb.llm.client import LLMClient
 from ragkb.parse.markdown import parse_document
-from ragkb.parse.model import Document
+from ragkb.parse.source import SUPPORTED_EXTENSIONS, source_bundle_sha
 from ragkb.pipeline.aggregate import aggregate_by_topic
 from ragkb.pipeline.classify import classify_sections
 from ragkb.pipeline.dedup import dedup_qa
 from ragkb.pipeline.events import EventBus
-from ragkb.pipeline.extract import extract_qa, extract_sop
+from ragkb.pipeline.extract import extract_qa, extract_qa_sections, extract_sop
 from ragkb.pipeline.gate_semantic import review_qa
 from ragkb.pipeline.gate_struct import gate_qa, gate_sop
-from ragkb.pipeline.paraphrase import add_paraphrases
+from ragkb.pipeline.paraphrase import add_paraphrases_batch
+from ragkb.pipeline.sections import split_oversize_sections
 from ragkb.pipeline.units import QAUnit, SOPUnit
 from ragkb.pipeline.vision import vision_read_image
 from ragkb.store.cache import Cache
@@ -57,22 +56,20 @@ class DocResult:
 
 
 def discover_topics(input_dir: Path) -> list[Path]:
-    """Each subfolder containing 原始文档.md is one topic/document."""
-    out = []
+    """Recursively discover every supported source file, independent of naming."""
     if not input_dir.is_dir():
-        return out
-    # The material nests under a single top folder (知识库配对素材); descend into it.
-    roots = [input_dir]
-    for child in sorted(input_dir.iterdir()):
-        if child.is_dir():
-            roots.append(child)
-    seen = set()
-    for root in roots:
-        for md in sorted(root.glob("*/原始文档.md")):
-            if md.parent not in seen:
-                seen.add(md.parent)
-                out.append(md)
-    return out
+        return []
+    return sorted(p for p in input_dir.rglob("*")
+                  if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+                  and not any(part.startswith(".") for part in p.relative_to(input_dir).parts))
+
+
+def _topic_for(path: Path, input_dir: Path) -> str:
+    """Stable human-readable document key, compatible with 原始文档.md layouts."""
+    if path.stem.lower() in {"原始文档", "index"} and path.parent != input_dir:
+        return path.parent.name
+    parent = path.parent.name if path.parent != input_dir else ""
+    return f"{parent}__{path.stem}" if parent else path.stem
 
 
 class Orchestrator:
@@ -87,20 +84,36 @@ class Orchestrator:
         self._results: dict[str, DocResult] = {}
         self._lock = threading.Lock()
         self._running = False
-        # Concurrency model (redesigned for throughput without nesting explosion):
-        # docs are processed ONE AT A TIME, but each doc fans its independent
-        # sections out to this many concurrent LLM calls. So total in-flight =
-        # _section_workers (not docs × sections). This is the single global
-        # ceiling; the vendored client is thread-safe so one client is shared.
-        self._section_workers = max(self.settings.max_workers, 8)
+        self._failed_this_run: set[str] = set()
+        self._load_previous_results()
+
+    def _load_previous_results(self) -> None:
+        """Hydrate the last successful snapshot for incremental/crash-safe runs."""
+        results_file = self.settings.output_dir / "results.json"
+        if not results_file.is_file():
+            return
+        try:
+            from ragkb.pipeline.export import load_results
+            qa, sop = load_results(self.settings.output_dir)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            log.warning("cannot load previous results: %s", exc)
+            return
+        for unit in qa:
+            unit.semantic_ok = True
+            topic = unit.sources[0].topic if unit.sources else ""
+            self._results.setdefault(topic, DocResult(topic=topic)).qa.append(unit)
+        for unit in sop:
+            topic = unit.sources[0].topic if unit.sources else ""
+            self._results.setdefault(topic, DocResult(topic=topic)).sop.append(unit)
+        self._consolidated_qa = qa
 
     # ---- per-document pipeline -------------------------------------------
-    def _process_doc(self, md_path: Path) -> DocResult:
-        topic = md_path.parent.name
+    def _process_doc(self, md_path: Path, topic: str | None = None) -> DocResult:
+        topic = topic or _topic_for(md_path, self.settings.input_dir)
         self.bus.publish("doc_status", topic, status="running")
         self.manifest.update(topic, status="running", error="")
         try:
-            doc = parse_document(md_path)
+            doc = parse_document(md_path, topic=topic)
             self.manifest.update(topic, source_sha=doc.source_sha)
             # 1. Vision-read every image (replaces weak inline OCR).
             imgs = doc.all_images()
@@ -109,49 +122,35 @@ class Orchestrator:
                 self.bus.publish("doc_progress", topic, stage="vision",
                                  done=k + 1, total=len(imgs))
             # 2. Classify sections.
-            secs = [s for s in doc.iter_sections() if s.body.strip() or s.images]
+            secs = split_oversize_sections(
+                [s for s in doc.iter_sections() if s.body.strip() or s.images])
             labels = classify_sections(secs, self.llm)
-            # 3. Extract per section by label — CONCURRENTLY within the doc. All
-            #    sections of a doc are independent, so a thread pool turns a serial
-            #    per-section wait into parallel calls. Bounded by _section_workers
-            #    so total in-flight stays under the gateway's comfort zone.
-            qa: list[QAUnit] = []
+            # 3. Extract with size-aware batches. Documents are the concurrency
+            #    boundary, so there is no nested pool multiplying gateway pressure.
             sop: list[SOPUnit] = []
             qa_secs = [s for s in secs if labels.get(s.sid, "qa") == "qa"]
             sop_secs = [s for s in secs if labels.get(s.sid, "qa") == "sop"]
-            done = [0]
             total = len(qa_secs) + len(sop_secs)
-
-            def _tick():
-                done[0] += 1
+            qa = extract_qa_sections(doc, qa_secs, self.llm, cache=self.cache)
+            self.bus.publish("doc_progress", topic, stage="extract",
+                             done=len(qa_secs), total=total)
+            for done, section in enumerate(sop_secs, start=len(qa_secs) + 1):
+                unit = extract_sop(doc, section, self.llm, cache=self.cache)
+                if unit:
+                    sop.append(unit)
                 self.bus.publish("doc_progress", topic, stage="extract",
-                                 done=done[0], total=total)
-
-            with ThreadPoolExecutor(max_workers=self._section_workers) as pool:
-                qa_futs = [pool.submit(extract_qa, doc, s, self.llm, cache=self.cache)
-                           for s in qa_secs]
-                sop_futs = [pool.submit(extract_sop, doc, s, self.llm, cache=self.cache)
-                            for s in sop_secs]
-                for fut in as_completed(qa_futs):
-                    qa.extend(fut.result() or [])
-                    _tick()
-                for fut in as_completed(sop_futs):
-                    u = fut.result()
-                    if u:
-                        sop.append(u)
-                    _tick()
+                                 done=done, total=total)
             # 4. Layer 1 structural gate (retry truncated once with more tokens).
             for u in qa:
                 gate_qa(u)
             for u in sop:
                 gate_sop(u)
             qa = self._retry_truncated_qa(doc, secs, labels, qa)
-            # 5. Paraphrase (recall boost) — only for struct-ok units, CONCURRENTLY.
+            sop = self._retry_truncated_sop(doc, secs, sop)
+            # 5. Paraphrase (recall boost) in cheap Flash batches.
             ok_units = [u for u in qa if u.struct_ok]
             if ok_units:
-                with ThreadPoolExecutor(max_workers=self._section_workers) as pool:
-                    list(pool.map(
-                        lambda u: add_paraphrases(u, self.llm, self.cache), ok_units))
+                add_paraphrases_batch(ok_units, self.llm, self.cache)
             res = DocResult(topic=topic, qa=qa, sop=sop)
             self._publish_units(topic, qa, sop)
             return res
@@ -159,6 +158,8 @@ class Orchestrator:
             log.exception("doc %s failed", topic)
             self.bus.publish("error", topic, message=str(exc))
             self.manifest.update(topic, status="failed", error=str(exc))
+            with self._lock:
+                self._failed_this_run.add(topic)
             return DocResult(topic=topic, error=str(exc))
 
     def _retry_truncated_qa(self, doc, secs, labels, qa):
@@ -174,12 +175,31 @@ class Orchestrator:
             s = by_sid.get(sid)
             if not s:
                 continue
-            retried = extract_qa(doc, s, self.llm)  # extract_qa uses a 4096 budget
+            retried = extract_qa(doc, s, self.llm, cache=self.cache, max_tokens=8192)
             for u in retried:
                 gate_qa(u)
             good.extend(retried)
             self.bus.publish("log", doc.topic,
                              message=f"retried truncated section {sid}")
+        return good
+
+    def _retry_truncated_sop(self, doc, secs, sop):
+        bad_sids = {p.section_sid for u in sop if u.truncated for p in u.sources}
+        if not bad_sids:
+            return sop
+        by_sid = {s.sid: s for s in secs}
+        good = [u for u in sop if not u.truncated]
+        for sid in bad_sids:
+            section = by_sid.get(sid)
+            if not section:
+                continue
+            retried = extract_sop(doc, section, self.llm, cache=self.cache,
+                                  max_tokens=12288)
+            if retried:
+                gate_sop(retried)
+                good.append(retried)
+            self.bus.publish("log", doc.topic,
+                             message=f"retried truncated SOP section {sid}")
         return good
 
     def _publish_units(self, topic, qa, sop):
@@ -198,15 +218,31 @@ class Orchestrator:
         dedup globally. `force` ignores the idempotency skip (but never touches
         pinned docs)."""
         self._running = True
+        self._failed_this_run.clear()
+        usage_before = self.llm.total_usage
+        before = (usage_before.prompt_tokens, usage_before.completion_tokens,
+                  usage_before.total_tokens, usage_before.calls)
         self.bus.publish("run_status", status="started")
         md_paths = discover_topics(self.settings.input_dir)
+        topics = {p: _topic_for(p, self.settings.input_dir) for p in md_paths}
+        # Defend against same-named files in different branches without changing
+        # familiar keys in the normal case.
+        counts: dict[str, int] = {}
+        for topic in topics.values():
+            counts[topic] = counts.get(topic, 0) + 1
+        for path, topic in list(topics.items()):
+            if counts[topic] > 1:
+                import hashlib
+                suffix = hashlib.sha256(str(path.relative_to(self.settings.input_dir)).encode()).hexdigest()[:8]
+                topics[path] = f"{topic}__{suffix}"
         if only:
-            md_paths = [p for p in md_paths if p.parent.name in set(only)]
+            selected = set(only)
+            md_paths = [p for p in md_paths if topics[p] in selected]
 
         # Seed manifest entries and decide skips.
         todo: list[Path] = []
         for p in md_paths:
-            topic = p.parent.name
+            topic = topics[p]
             sha = _sha_of(p)
             if not self.manifest.get(topic):
                 self.manifest.upsert(DocState(topic=topic, source_sha=sha))
@@ -219,35 +255,46 @@ class Orchestrator:
                 continue
             todo.append(p)
 
-        # Docs processed SERIALLY — each doc fans its sections out concurrently
-        # (see _process_doc), so parallelism lives at the section level and total
-        # in-flight is bounded by _section_workers. Serial docs also give clean
-        # per-doc progress and keep one doc's failure isolated.
-        for p in todo:
-            res = self._process_doc(p)
-            with self._lock:
-                self._results[res.topic] = res
-
-        # Global consolidation across everything we have (fresh + previously done
-        # non-pinned results in memory this run).
-        self._consolidate()
-        self._persist_results()
-        self.bus.publish("run_status", status="done")
-        self._running = False
-        return dict(self._results)
+        try:
+            with ThreadPoolExecutor(max_workers=self.settings.max_workers) as pool:
+                futures = {pool.submit(self._process_doc, p, topics[p]): p for p in todo}
+                for future in as_completed(futures):
+                    res = future.result()
+                    # A failed retry must not erase the last known-good snapshot.
+                    if not res.error or res.topic not in self._results:
+                        with self._lock:
+                            self._results[res.topic] = res
+            self._consolidate()
+            self._persist_results()
+            usage = self.llm.total_usage
+            self.bus.publish(
+                "run_status", status="done", calls=usage.calls - before[3],
+                prompt_tokens=usage.prompt_tokens - before[0],
+                completion_tokens=usage.completion_tokens - before[1],
+                total_tokens=usage.total_tokens - before[2])
+            return dict(self._results)
+        finally:
+            self._running = False
 
     def _consolidate(self) -> None:
         """Cross-file aggregate + semantic review + dedup over the union of all QA."""
         all_qa: list[QAUnit] = []
         for res in self._results.values():
             all_qa.extend([u for u in res.qa if u.struct_ok])
-        if not all_qa:
-            return
-        # Cross-file aggregate (by topic), then one global semantic review, then dedup.
+        # Cross-file aggregate (by topic), then review only new/changed units.
         aggregated = aggregate_by_topic(all_qa)
-        self.bus.publish("log", message=f"aggregated {len(all_qa)}→{len(aggregated)} QA; reviewing…")
-        review_qa(aggregated, self.llm, policy=self.settings.semantic_gate_policy)
+        pending_review = [u for u in aggregated if u.semantic_ok is None]
+        self.bus.publish("log", message=f"aggregated {len(all_qa)}→{len(aggregated)} QA; "
+                                        f"reviewing {len(pending_review)} changed units")
+        review_qa(pending_review, self.llm, policy=self.settings.semantic_gate_policy,
+                  model=self.settings.reviewer_model or None)
         survivors = [u for u in aggregated if u.semantic_ok]
+        rejected_by_topic: dict[str, int] = {}
+        for unit in aggregated:
+            if unit.semantic_ok:
+                continue
+            topic = unit.sources[0].topic if unit.sources else ""
+            rejected_by_topic[topic] = rejected_by_topic.get(topic, 0) + 1
         deduped = dedup_qa(survivors)
         self.bus.publish("log",
                          message=f"review kept {len(survivors)}/{len(aggregated)}; dedup→{len(deduped)}")
@@ -258,9 +305,12 @@ class Orchestrator:
             by_topic.setdefault(topic, []).append(u)
         for topic, res in self._results.items():
             res.qa = by_topic.get(topic, [])
+            if topic in self._failed_this_run:
+                continue
             self.manifest.update(
                 topic, status="done",
                 extracted=len(res.qa), passed=len(res.qa),
+                rejected=rejected_by_topic.get(topic, 0),
                 needs_review=sum(1 for u in res.qa if u.needs_review),
                 sop_count=len(res.sop))
         # Stash the fully consolidated set for export.
@@ -289,13 +339,14 @@ class Orchestrator:
                     "paraphrases": u.paraphrases,
                     "needs_review": u.needs_review,
                     "semantic_reason": u.semantic_reason,
-                    "sources": [s.to_dict() for s in u.sources]})
+                    "semantic_ok": u.semantic_ok,
+                    "sources": [s.to_dict(include_excerpt=True) for s in u.sources]})
             for u in res.sop:
                 payload["sop"].append({
                     "title": u.title, "markdown": u.markdown,
                     "entry_questions": u.entry_questions,
                     "struct_ok": u.struct_ok,
-                    "sources": [s.to_dict() for s in u.sources]})
+                    "sources": [s.to_dict(include_excerpt=True) for s in u.sources]})
         tmp = out.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), "utf-8")
         tmp.replace(out)
@@ -326,5 +377,4 @@ class Orchestrator:
 
 
 def _sha_of(path: Path) -> str:
-    import hashlib
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return source_bundle_sha(path)

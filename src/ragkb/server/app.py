@@ -19,7 +19,7 @@ import queue
 import threading
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
@@ -38,15 +38,22 @@ def create_app() -> FastAPI:
     run_lock = threading.Lock()
     state = {"running": False}
 
-    def _run(only=None, force=False):
-        with run_lock:
-            if state["running"]:
-                return
-            state["running"] = True
+    def _run_reserved(only=None, force=False):
+        """Execute a run after the API handler atomically reserved the slot."""
         try:
             orch.run(only=only, force=force)
         finally:
-            state["running"] = False
+            with run_lock:
+                state["running"] = False
+
+    def _start_run(only=None, force=False) -> bool:
+        with run_lock:
+            if state["running"]:
+                return False
+            state["running"] = True
+        threading.Thread(target=_run_reserved,
+                         kwargs={"only": only, "force": force}, daemon=True).start()
+        return True
 
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -93,13 +100,17 @@ def create_app() -> FastAPI:
         body = await _json(request)
         only = body.get("only")
         force = bool(body.get("force", False))
-        threading.Thread(target=_run, kwargs={"only": only, "force": force},
-                         daemon=True).start()
+        if not _start_run(only=only, force=force):
+            raise HTTPException(status_code=409, detail="pipeline is already running")
         return {"ok": True}
 
     @app.post("/api/export")
     def api_export():
-        stats = orch.export()
+        with run_lock:
+            if state["running"]:
+                raise HTTPException(status_code=409,
+                                    detail="cannot export while pipeline is running")
+            stats = orch.export()
         return {"ok": True, "stats": stats.__dict__}
 
     @app.post("/api/pin")
@@ -115,8 +126,8 @@ def create_app() -> FastAPI:
     async def api_retry(request: Request):
         body = await _json(request)
         topics = body.get("topics") or []
-        threading.Thread(target=_run, kwargs={"only": topics, "force": True},
-                         daemon=True).start()
+        if not _start_run(only=topics, force=True):
+            raise HTTPException(status_code=409, detail="pipeline is already running")
         return {"ok": True}
 
     return app

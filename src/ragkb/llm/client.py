@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import threading
 import time
@@ -180,6 +181,9 @@ class LLMClient:
         # new client and may probe again after quota has recovered.
         self._quota_lock = threading.Lock()
         self._quota_failures: dict[str, str] = {}
+        self._slots = threading.BoundedSemaphore(self.settings.max_concurrency)
+        self._usage_lock = threading.Lock()
+        self.total_usage = LLMUsage()
 
     def close(self) -> None:
         if self._owns_client:
@@ -232,7 +236,10 @@ class LLMClient:
         for model in self._available_models(chain):
             self._local.effective_model = model
             try:
-                res = fn()
+                with self._slots:
+                    res = fn()
+                with self._usage_lock:
+                    self.total_usage.add(res.usage)
                 self.last_model = res.model or model
                 return res
             except LLMQuotaError as exc:
@@ -530,7 +537,8 @@ class LLMClient:
                 raise  # bypass transient-retry; deterministic — no point retrying
             except (httpx.HTTPError, LLMError, KeyError, ValueError) as exc:
                 last_err = exc
-                wait = min(2 ** attempt, 10)
+                wait = _retry_delay(attempt, resp.headers.get("Retry-After")
+                                    if "resp" in locals() else None)
                 log.warning("anthropic call failed (attempt %d/%d): %s; retry in %ds",
                             attempt, self.settings.max_retries, exc, wait)
                 if attempt < self.settings.max_retries:
@@ -619,7 +627,8 @@ class LLMClient:
                 raise
             except (httpx.HTTPError, LLMError, KeyError, ValueError) as exc:
                 last_err = exc
-                wait = min(2 ** attempt, 10)
+                wait = _retry_delay(attempt, resp.headers.get("Retry-After")
+                                    if "resp" in locals() else None)
                 log.warning("gemini call failed (attempt %d/%d): %s; retry in %ds",
                             attempt, self.settings.max_retries, exc, wait)
                 if attempt < self.settings.max_retries:
@@ -688,7 +697,8 @@ class LLMClient:
                 raise  # bypass transient-retry; deterministic — no point retrying
             except (httpx.HTTPError, LLMError, KeyError, ValueError) as exc:
                 last_err = exc
-                wait = min(2 ** attempt, 10)
+                wait = _retry_delay(attempt, resp.headers.get("Retry-After")
+                                    if "resp" in locals() else None)
                 log.warning("LLM call failed (attempt %d/%d): %s; retrying in %ds",
                             attempt, self.settings.max_retries, exc, wait)
                 if attempt < self.settings.max_retries:
@@ -878,6 +888,17 @@ def _gemini_result(data: dict, model: str) -> LLMResult:
     pt = usage_raw.get("promptTokenCount", 0)
     ct = usage_raw.get("candidatesTokenCount", 0)
     usage = LLMUsage(prompt_tokens=pt, completion_tokens=ct,
-                     total_tokens=pt + ct, calls=1)
+                     total_tokens=usage_raw.get("totalTokenCount", pt + ct), calls=1)
     return LLMResult(text="".join(text_parts).strip(), usage=usage,
                      model=data.get("modelVersion", model), finish_reason=finish)
+
+
+def _retry_delay(attempt: int, retry_after: str | None = None) -> float:
+    """Exponential backoff with jitter, honoring a bounded Retry-After value."""
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0.0), 30.0)
+        except (TypeError, ValueError):
+            pass
+    base = min(2 ** attempt, 10)
+    return base * random.uniform(0.75, 1.25)

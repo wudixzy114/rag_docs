@@ -152,6 +152,7 @@ def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
     # are never clobbered — both can coexist in output/.
     csv_name = "qa_pairs.csv" if include_paraphrases else "qa_pairs_no_paraphrase.csv"
     zip_name = "知识库上传包.zip" if include_paraphrases else "知识库上传包_无扩写.zip"
+    _clear_generated(output_dir, csv_name)
 
     # 1. Global qa CSV (all modules, with Module column).
     stats.qa_rows = _write_qa_csv(output_dir / csv_name, qa_units, include_paraphrases)
@@ -203,6 +204,20 @@ def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
     _write_upload_zip(output_dir, csv_name=csv_name, zip_name=zip_name)
 
     return stats
+
+
+def _clear_generated(output_dir: Path, csv_name: str) -> None:
+    """Remove stale files owned by this export variant before regenerating it."""
+    sop_dir = output_dir / "sop"
+    if sop_dir.is_dir():
+        for path in sop_dir.rglob("*.md"):
+            path.unlink()
+    by_module = output_dir / "by_module"
+    if by_module.is_dir():
+        for path in by_module.rglob(csv_name):
+            path.unlink()
+        for path in by_module.glob("*/sop/*.md"):
+            path.unlink()
 
 
 def _write_upload_zip(output_dir: Path, csv_name: str = "qa_pairs.csv",
@@ -259,7 +274,8 @@ def _prov_from_dict(d: dict) -> Provenance:
     return Provenance(
         topic=d.get("topic", ""), doc_title=d.get("doc_title", ""),
         heading_path=d.get("heading_path", ""), section_sid=d.get("section_sid", ""),
-        source_sha=d.get("source_sha", ""), image_refs=list(d.get("image_refs", [])))
+        source_sha=d.get("source_sha", ""), image_refs=list(d.get("image_refs", [])),
+        source_excerpt=d.get("source_excerpt", ""))
 
 
 def load_results(output_dir: Path) -> tuple[list[QAUnit], list[SOPUnit]]:
@@ -284,6 +300,7 @@ def load_results(output_dir: Path) -> tuple[list[QAUnit], list[SOPUnit]]:
                  paraphrases=list(d.get("paraphrases", [])),
                  needs_review=d.get("needs_review", False),
                  semantic_reason=d.get("semantic_reason", ""),
+                 semantic_ok=d.get("semantic_ok", True),
                  sources=[_prov_from_dict(s) for s in d.get("sources", [])])
           for d in data.get("qa", [])]
     sop = [SOPUnit(title=d["title"], markdown=d["markdown"],

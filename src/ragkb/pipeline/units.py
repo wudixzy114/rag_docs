@@ -27,11 +27,15 @@ class Provenance:
     section_sid: str = ""         # dotted id within doc
     source_sha: str = ""          # sha of the source file, for incremental re-run
     image_refs: list[str] = field(default_factory=list)
+    source_excerpt: str = ""       # masked source evidence used by semantic review
 
-    def to_dict(self) -> dict:
-        return {"topic": self.topic, "doc_title": self.doc_title,
+    def to_dict(self, include_excerpt: bool = False) -> dict:
+        data = {"topic": self.topic, "doc_title": self.doc_title,
                 "heading_path": self.heading_path, "section_sid": self.section_sid,
                 "source_sha": self.source_sha, "image_refs": self.image_refs}
+        if include_excerpt and self.source_excerpt:
+            data["source_excerpt"] = self.source_excerpt
+        return data
 
 
 @dataclass

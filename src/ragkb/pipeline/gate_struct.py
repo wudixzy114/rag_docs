@@ -16,13 +16,26 @@ Checks:
 """
 from __future__ import annotations
 
+import re
+
 from ragkb.pipeline.units import QAUnit, SOPUnit
 
 _MIN_ANSWER = 1        # non-empty; we do NOT impose a length floor (would lose info)
 
 
 def _fence_balanced(text: str) -> bool:
-    return (text or "").count("```") % 2 == 0
+    opened: tuple[str, int] | None = None
+    for line in (text or "").splitlines():
+        match = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if not match:
+            continue
+        marker = match.group(1)
+        current = (marker[0], len(marker))
+        if opened is None:
+            opened = current
+        elif current[0] == opened[0] and current[1] >= opened[1]:
+            opened = None
+    return opened is None
 
 
 def gate_qa(unit: QAUnit) -> QAUnit:
@@ -52,6 +65,8 @@ def gate_sop(unit: SOPUnit) -> SOPUnit:
         reasons.append("unbalanced_code_fence")
     if not unit.entry_questions:
         reasons.append("no_entry_questions")
+    if unit.markdown.strip() and not re.search(r"^#{1,6}\s+\S", unit.markdown, re.MULTILINE):
+        reasons.append("no_markdown_heading")
     unit.struct_ok = not reasons
     unit.struct_reason = ";".join(reasons)
     return unit

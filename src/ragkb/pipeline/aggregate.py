@@ -43,6 +43,8 @@ def _fold(keep: QAUnit, drop: QAUnit) -> None:
         keep.answer = drop.answer
     keep.sources.extend(drop.sources)
     keep.needs_review = keep.needs_review or drop.needs_review
+    if keep.semantic_ok is None or drop.semantic_ok is None:
+        keep.semantic_ok = None
 
 
 def aggregate_by_topic(units: list[QAUnit]) -> list[QAUnit]:

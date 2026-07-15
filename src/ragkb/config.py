@@ -119,13 +119,13 @@ class LLMSettings(BaseSettings):
 
     base_url: str = Field(default="http://llm-gw.jd.local/v1", alias="JD_LLM_BASE_URL")
     api_key: str = Field(default="", alias="JD_LLM_API_KEY")
-    model: str = Field(default="Claude-Opus-4.8-joybuilder", alias="XIAOSHU_MODEL")
+    model: str = Field(default="Gemini-3.1-Pro-Preview-joybuilder", alias="XIAOSHU_MODEL")
     # Ordered fallback chain, comma-separated in env. Tried in order after the
     # primary model returns a quota/429 error. Default keeps the fleet alive when
     # any single model is exhausted (the primary is prepended automatically, so
     # listing it here is harmless).
     fallback_models_raw: str = Field(
-        default="Claude-Opus-4.8-joybuilder,Claude-Opus-4.7-joybuilder,DeepSeek-V4-Pro-joybuilder",
+        default="Gemini-3.1-Pro-Preview-joybuilder,Gemini-3-Flash-Preview-joybuilder,Claude-Sonnet-4.6-joybuilder",
         alias="JD_LLM_FALLBACK_MODELS")
     # Optional multi-provider registry, JSON array in env. Each entry:
     # {"name","base_url","api_key","dialect":"openai"|"anthropic","models":[...]}.
@@ -148,6 +148,8 @@ class LLMSettings(BaseSettings):
     simple_models_raw: str = Field(default="", alias="JD_LLM_SIMPLE_MODELS")
     timeout_seconds: float = Field(default=90.0, alias="JD_LLM_TIMEOUT")
     max_retries: int = Field(default=3, alias="JD_LLM_MAX_RETRIES")
+    max_concurrency: int = Field(default=4, ge=1, le=16,
+                                 alias="JD_LLM_MAX_CONCURRENCY")
 
     @staticmethod
     def model_is_anthropic(model: str) -> bool:
@@ -210,7 +212,7 @@ class LLMSettings(BaseSettings):
             if not isinstance(entry, dict) or not entry.get("base_url"):
                 continue
             dialect = str(entry.get("dialect") or "openai").lower()
-            if dialect not in ("openai", "anthropic"):
+            if dialect not in ("openai", "anthropic", "gemini"):
                 dialect = "openai"
             models = entry.get("models") or []
             out.append(ProviderSpec(
@@ -271,7 +273,14 @@ class LLMSettings(BaseSettings):
         client still walks `fallback_chain` from this model on a quota error."""
         if not task:
             return self.model
-        return self._task_models().get(task, self.model)
+        configured = self._task_models()
+        if task in configured:
+            return configured[task]
+        if task in {"classify", "paraphrase"}:
+            return "Gemini-3-Flash-Preview-joybuilder"
+        if task in {"extract", "sop", "review", "aggregate"}:
+            return "Gemini-3.1-Pro-Preview-joybuilder"
+        return self.model
 
     def chain_for(self, task: str | None) -> list[str]:
         """Fallback chain to try for a task: the task's primary first, then any
@@ -314,7 +323,8 @@ class LLMSettings(BaseSettings):
         if raw:
             models = [m.strip() for m in raw.split(",") if m.strip()]
         else:
-            models = self.fallback_chain
+            models = ["Gemini-3-Flash-Preview-joybuilder",
+                      "Gemini-3.1-Pro-Preview-joybuilder", *self.fallback_chain]
         seen, out = set(), []
         for m in models:
             if m and m not in seen:

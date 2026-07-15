@@ -5,51 +5,68 @@ the answer accurate, unambiguous, complete, and on-topic? This is the gate the
 user asked to be model-driven ("用另一个很强的模型去审核"), and every unit is
 reviewed (the doc set is small, so no sampling).
 
-Design, lifted from magnus-lens verify.py:
-- BATCHED + indexed verdicts (25/call), chunks run concurrently (cap 4) — turns N
-  calls into N/25.
+Design:
+- Size-bounded indexed batches turn N calls into a small number of calls without
+  allowing one huge evidence item to overflow the context budget.
 - Tolerant JSON parse + one bounded repair pass for missing ids.
 - FAIL-CLOSED: a unit with no verdict after repair is NOT silently passed. Under
   the default policy it's dropped (marked semantic_ok=False); the caller may
   switch to keep-for-review.
-- CROSS-MODEL: the reviewer routes through task="review", which .env points at a
-  DIFFERENT model than extraction — an independent perspective catches errors a
-  model's own self-review misses.
+- Evidence-grounded: the reviewer receives the masked source excerpt and image
+  transcript, plus every generated query variant. A separate reviewer model can
+  still be configured, while the default uses Gemini 3.1 Pro for quality.
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from ragkb.llm.client import LLMClient, LLMError, LLMQuotaError
+from ragkb.pipeline.batching import pack_by_size
+from ragkb.pipeline.gate_struct import gate_qa
 from ragkb.pipeline.jsonutil import parse_json_array
 from ragkb.pipeline.prompts import REVIEW_SYSTEM, build_review_user
 from ragkb.pipeline.units import QAUnit
 
 log = logging.getLogger(__name__)
 
-_REVIEW_BATCH = 25
-_REVIEW_MAX_TOKENS = 2048
+_REVIEW_BATCH = 12
+_REVIEW_MAX_CHARS = 36000
+_REVIEW_MAX_TOKENS = 4096
+
+
+@dataclass
+class _Verdict:
+    verdict: str
+    reason: str
+    revised_answer: str = ""
+    revised_query: str = ""
+    valid_paraphrases: list[str] | None = None
 
 
 def _source_text(unit: QAUnit) -> str:
-    """The provenance heading path(s) — a compact grounding reference for the
-    reviewer. (Full source body isn't threaded here to keep the prompt bounded;
-    the extractor already grounded on it, and the reviewer checks internal
-    consistency + the heading context.)"""
-    return " | ".join(p.heading_path for p in unit.sources if p.heading_path)
+    """Grounding evidence, including the source excerpt rather than headings only."""
+    parts = []
+    for p in unit.sources:
+        excerpt = p.source_excerpt.strip()
+        parts.append(f"[{p.heading_path or p.doc_title}]\n{excerpt}" if excerpt
+                     else f"[{p.heading_path or p.doc_title}]（原文缺失）")
+    return "\n\n".join(parts)[:12000]
 
 
-def _run_batch(chunk: list[QAUnit], llm: LLMClient) -> dict[int, tuple[str, str]]:
+def _run_batch(indexed: list[tuple[int, QAUnit]], llm: LLMClient,
+               model: str | None = None) -> dict[int, _Verdict]:
     items = [{"id": i, "query": u.query, "answer": u.answer,
-              "source": _source_text(u)} for i, u in enumerate(chunk)]
+              "paraphrases": u.paraphrases,
+              "source": _source_text(u)} for i, u in indexed]
     r = llm.complete(system=REVIEW_SYSTEM, user=build_review_user(items),
-                     max_tokens=_REVIEW_MAX_TOKENS, task="review")
+                     max_tokens=_REVIEW_MAX_TOKENS, task="review", model=model)
     return _parse_verdicts(r.text)
 
 
-def _parse_verdicts(text: str) -> dict[int, tuple[str, str]]:
+def _parse_verdicts(text: str) -> dict[int, _Verdict]:
     arr = parse_json_array(text) or []
-    out: dict[int, tuple[str, str]] = {}
+    out: dict[int, _Verdict] = {}
     for el in arr:
         if not isinstance(el, dict) or "id" not in el:
             continue
@@ -60,15 +77,20 @@ def _parse_verdicts(text: str) -> dict[int, tuple[str, str]]:
         verdict = str(el.get("verdict", "")).lower()
         if verdict not in ("pass", "revise", "reject"):
             continue
-        out[idx] = (verdict, str(el.get("reason", "")))
+        valid = el.get("valid_paraphrases")
+        valid = [str(v).strip() for v in valid if str(v).strip()] if isinstance(valid, list) else None
+        out[idx] = _Verdict(
+            verdict=verdict, reason=str(el.get("reason", "")),
+            revised_answer=str(el.get("revised_answer", "")).strip(),
+            revised_query=str(el.get("revised_query", "")).strip(),
+            valid_paraphrases=valid)
     return out
 
 
 def review_qa(units: list[QAUnit], llm: LLMClient,
-              policy: str = "fail_closed") -> list[QAUnit]:
-    """Review every unit with the strong model (task='review' → Opus-4.8: generate
-    first, review second, same top model). Annotates semantic_ok / semantic_reason
-    / needs_review.
+              policy: str = "fail_closed", model: str | None = None) -> list[QAUnit]:
+    """Review every unit with the strong task route (Gemini 3.1 Pro by default).
+    Annotates semantic_ok / semantic_reason / needs_review.
 
     Quota-aware (user's rule "审核没余额就不跑了"): if the reviewer model's quota is
     exhausted, we DON'T fail-closed-drop everything and we DON'T burn the run —
@@ -81,47 +103,108 @@ def review_qa(units: list[QAUnit], llm: LLMClient,
     """
     if not units:
         return units
-    chunks = [units[i:i + _REVIEW_BATCH] for i in range(0, len(units), _REVIEW_BATCH)]
+    indexed = list(enumerate(units))
+    chunks = pack_by_size(
+        indexed,
+        lambda pair: len(pair[1].query) + len(pair[1].answer) + len(_source_text(pair[1])),
+        max_items=_REVIEW_BATCH, max_chars=_REVIEW_MAX_CHARS)
 
-    results = []
-    for chunk in chunks:
+    verdicts: dict[int, _Verdict] = {}
+    for chunk_no, chunk in enumerate(chunks):
         try:
-            verdicts = _run_batch(chunk, llm)
+            batch_verdicts = _run_batch(chunk, llm, model=model)
         except LLMQuotaError:
             # Reviewer out of quota — stop reviewing entirely. Keep everything
             # already-and-not-yet reviewed, flagged for human review.
             log.warning("reviewer quota exhausted; skipping semantic review for "
                         "remaining %d units (kept, flagged needs_review)",
-                        sum(len(c) for c in chunks[chunks.index(chunk):]))
+                        sum(len(c) for c in chunks[chunk_no:]))
+            _apply_known(units, verdicts)
             _mark_skipped(units)
             return units
         except LLMError as exc:
             log.warning("review batch failed (%d items): %s", len(chunk), exc)
-            verdicts = {}
-        results.append((chunk, verdicts))
+            batch_verdicts = {}
+        verdicts.update(batch_verdicts)
 
-    for chunk, verdicts in results:
-        for i, u in enumerate(chunk):
-            if i not in verdicts:
-                # No verdict after the batch — fail-closed. Never publish unreviewed.
-                if policy == "keep":
-                    u.semantic_ok = True
-                    u.needs_review = True
-                    u.semantic_reason = "no_verdict:kept_for_review"
-                else:
-                    u.semantic_ok = False
-                    u.semantic_reason = "no_verdict:dropped"
-                continue
-            verdict, reason = verdicts[i]
-            u.semantic_reason = f"{verdict}:{reason}"
-            if verdict == "pass":
-                u.semantic_ok = True
-            elif verdict == "revise":
+        # One bounded repair call containing only omitted IDs. This makes the
+        # documented repair behavior real and avoids paying to re-review valid rows.
+        missing = [pair for pair in chunk if pair[0] not in batch_verdicts]
+        if missing:
+            try:
+                verdicts.update(_run_batch(missing, llm, model=model))
+            except LLMQuotaError:
+                _apply_known(units, verdicts)
+                _mark_skipped(units)
+                return units
+            except LLMError as exc:
+                log.warning("review repair failed (%d items): %s", len(missing), exc)
+
+    for i, u in indexed:
+        if i not in verdicts:
+            if policy == "keep":
                 u.semantic_ok = True
                 u.needs_review = True
-            else:  # reject
+                u.semantic_reason = "no_verdict:kept_for_review"
+            else:
                 u.semantic_ok = False
+                u.semantic_reason = "no_verdict:dropped"
+            continue
+        result = verdicts[i]
+        u.semantic_reason = f"{result.verdict}:{result.reason}"
+        _filter_paraphrases(u, result.valid_paraphrases)
+        if result.verdict == "pass":
+            u.semantic_ok = True
+        elif result.verdict == "revise" and (result.revised_answer or result.revised_query):
+            original_answer, original_query = u.answer, u.query
+            if result.revised_answer:
+                u.answer = result.revised_answer
+            if result.revised_query:
+                u.query = result.revised_query
+            gate_qa(u)
+            if u.struct_ok:
+                u.semantic_ok = True
+                u.needs_review = False
+            else:
+                u.answer, u.query = original_answer, original_query
+                u.semantic_ok = False
+                u.semantic_reason += ":invalid_revision"
+        elif result.verdict == "revise":
+            u.semantic_ok = False
+            u.semantic_reason += ":missing_revision"
+        else:
+            u.semantic_ok = False
     return units
+
+
+def _apply_known(units: list[QAUnit], verdicts: dict[int, _Verdict]) -> None:
+    """Preserve completed batch verdicts if reviewer quota ends mid-run."""
+    for idx, result in verdicts.items():
+        if not 0 <= idx < len(units):
+            continue
+        unit = units[idx]
+        unit.semantic_reason = f"{result.verdict}:{result.reason}"
+        _filter_paraphrases(unit, result.valid_paraphrases)
+        if result.verdict == "pass":
+            unit.semantic_ok = True
+        elif result.verdict == "revise" and (result.revised_answer or result.revised_query):
+            original_answer, original_query = unit.answer, unit.query
+            unit.answer = result.revised_answer or unit.answer
+            unit.query = result.revised_query or unit.query
+            gate_qa(unit)
+            if unit.struct_ok:
+                unit.semantic_ok = True
+            else:
+                unit.answer, unit.query = original_answer, original_query
+                unit.semantic_ok = False
+        else:
+            unit.semantic_ok = False
+
+
+def _filter_paraphrases(unit: QAUnit, approved: list[str] | None) -> None:
+    """Keep only exact submitted candidates; the reviewer cannot invent new keys."""
+    allowed = set(approved or [])
+    unit.paraphrases = [value for value in unit.paraphrases if value in allowed]
 
 
 def _mark_skipped(units: list[QAUnit]) -> None:
@@ -129,7 +212,7 @@ def _mark_skipped(units: list[QAUnit]) -> None:
     flag it for human review. Units already reviewed this run keep their verdict."""
     for u in units:
         if u.semantic_ok is None:
+            u.paraphrases = []
             u.semantic_ok = True
             u.needs_review = True
             u.semantic_reason = "review_skipped:no_quota"
-
