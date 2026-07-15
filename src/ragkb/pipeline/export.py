@@ -143,6 +143,11 @@ def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
     output_dir.mkdir(parents=True, exist_ok=True)
     qa_units = [u for u in qa_units
                 if u.publication_status != "failed_review" and u.semantic_ok is not False]
+    # Keep export replay behavior identical to Orchestrator.export(): a malformed
+    # or failed-review SOP must never reappear via load_results -> export_all.
+    sop_units = [u for u in sop_units
+                 if (u.struct_ok and u.publication_status != "failed_review"
+                     and u.semantic_ok is not False)]
     stats = ExportStats()
 
     # Source-faithful output is the primary artifact. The opt-in expanded variant
@@ -306,6 +311,13 @@ def load_results(output_dir: Path) -> tuple[list[QAUnit], list[SOPUnit]]:
     sop = [SOPUnit(title=d["title"], markdown=d["markdown"],
                    entry_questions=list(d.get("entry_questions", [])),
                    struct_ok=d.get("struct_ok", True),
+                   struct_reason=d.get("struct_reason", ""),
+                   semantic_ok=d.get("semantic_ok"),
+                   semantic_reason=d.get("semantic_reason", ""),
+                   needs_review=d.get("needs_review", False),
+                   review_attempts=d.get("review_attempts", 0),
+                   publication_status=d.get("publication_status", "pending"),
+                   review_history=list(d.get("review_history", [])),
                    sources=[_prov_from_dict(s) for s in d.get("sources", [])])
            for d in data.get("sop", [])]
     return qa, sop

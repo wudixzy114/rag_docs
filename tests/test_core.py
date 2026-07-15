@@ -1,6 +1,6 @@
 """Deterministic-core tests — no LLM, no network. These lock in the correctness
 guarantees the user cares most about: no scrambled sections, no truncated/empty
-units slipping through, clean 2-column CSV."""
+units slipping through, clean 3-column CSV."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -219,6 +219,23 @@ def test_export_never_publishes_failed_review_units(tmp_path):
     assert rows == [["Query", "Answer", "Module"]]
 
 
+def test_export_filters_invalid_sop_on_every_call_path(tmp_path):
+    good = SOPUnit(title="1. 正常", markdown="# 正常\n步骤", entry_questions=["怎么做"],
+                   semantic_ok=True, publication_status="approved",
+                   sources=[Provenance(topic="模块")])
+    bad_struct = SOPUnit(title="2. 结构失败", markdown="# 失败", entry_questions=[],
+                         struct_ok=False, struct_reason="no_entry_questions",
+                         sources=[Provenance(topic="模块")])
+    bad_semantic = SOPUnit(title="3. 语义失败", markdown="# 失败\n编造内容",
+                           entry_questions=["怎么做"], semantic_ok=False,
+                           publication_status="failed_review",
+                           sources=[Provenance(topic="模块")])
+    stats = export_all([], [good, bad_struct, bad_semantic], tmp_path)
+    files = list((tmp_path / "sop").glob("*.md"))
+    assert stats.sop_files == 1
+    assert [path.name for path in files] == ["模块__1.md"]
+
+
 def test_upload_zip_utf8_and_no_dsstore(tmp_path):
     """The zip must set the UTF-8 filename flag on CJK names (else mojibake on
     unzip) and never bundle .DS_Store."""
@@ -252,6 +269,42 @@ def test_export_round_trips_through_results_json(tmp_path):
     qa, sop = load_results(tmp_path)
     assert len(qa) == 2                    # cross-module twins both survive rehydration
     assert {u.sources[0].topic for u in qa} == {"09_9N-LLM", "10_9N-Tritium"}
+
+
+def test_sop_review_state_round_trips_through_results_json(tmp_path):
+    import json
+    from ragkb.pipeline.export import load_results
+    payload = {"qa": [], "sop": [{
+        "title": "流程", "markdown": "# 流程\n步骤",
+        "entry_questions": ["怎么做"], "struct_ok": True,
+        "semantic_ok": False, "semantic_reason": "reject:漏步骤",
+        "needs_review": True, "review_attempts": 1,
+        "publication_status": "failed_review", "review_history": ["reject:漏步骤"],
+        "sources": [{"topic": "模块"}],
+    }]}
+    (tmp_path / "results.json").write_text(
+        json.dumps(payload, ensure_ascii=False), "utf-8")
+    _, sop = load_results(tmp_path)
+    assert len(sop) == 1
+    assert sop[0].semantic_ok is False
+    assert sop[0].publication_status == "failed_review"
+    assert sop[0].review_attempts == 1
+
+
+def test_export_replay_does_not_restore_structurally_invalid_sop(tmp_path):
+    import json
+    from ragkb.pipeline.export import load_results
+    payload = {"qa": [], "sop": [{
+        "title": "坏流程", "markdown": "# 坏流程\n内容",
+        "entry_questions": [], "struct_ok": False,
+        "struct_reason": "no_entry_questions", "sources": [{"topic": "模块"}],
+    }]}
+    (tmp_path / "results.json").write_text(
+        json.dumps(payload, ensure_ascii=False), "utf-8")
+    qa, sop = load_results(tmp_path)
+    stats = export_all(qa, sop, tmp_path)
+    assert stats.sop_files == 0
+    assert not list((tmp_path / "sop").glob("*.md"))
 
 
 def test_reversible_mask_restore():

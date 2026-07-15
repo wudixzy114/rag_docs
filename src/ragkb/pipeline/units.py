@@ -1,7 +1,7 @@
 """Knowledge-unit data model — the pipeline's OUTPUT types.
 
 Two unit kinds, matching the two ingest formats:
-- `QAUnit`: one Query→Answer pair. Exports to the strict 2-column CSV. Carries
+- `QAUnit`: one Query→Answer pair. Exports to the strict 3-column CSV. Carries
   `paraphrases` (extra keys for the same answer — recall booster) and provenance
   (source topic/doc/section) that lives ONLY in the sidecar metadata.jsonl,
   never in the CSV.
@@ -83,6 +83,9 @@ class SOPUnit:
     semantic_ok: bool | None = None
     semantic_reason: str = ""
     needs_review: bool = False
+    review_attempts: int = 0
+    publication_status: str = "pending"  # pending|approved|failed_review
+    review_history: list[str] = field(default_factory=list)
 
     @property
     def unit_id(self) -> str:

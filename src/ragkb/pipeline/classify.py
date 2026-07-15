@@ -48,6 +48,18 @@ def _prefilter(title: str, body: str) -> str | None:
     return None       # ambiguous or no cue → let the LLM decide
 
 
+def _section_content(section: Section) -> str:
+    """Classification evidence, including authoritative image transcripts.
+
+    Screenshot-only sections are common in operational docs. Treating their
+    empty prose body as empty content would silently label them skip.
+    """
+    image_text = "\n\n".join(
+        f"[图片 {im.rel_path}]\n{im.best_text}"
+        for im in section.images if im.best_text)
+    return f"{section.body}\n\n{image_text}".strip()
+
+
 def classify_sections(sections: list[Section], llm: LLMClient) -> dict[str, str]:
     """Return {section.sid: label}. Pre-filter first; batch the rest to the LLM.
     On LLM failure, ambiguous sections default to 'qa' (safer than dropping — a
@@ -55,7 +67,7 @@ def classify_sections(sections: list[Section], llm: LLMClient) -> dict[str, str]
     labels: dict[str, str] = {}
     ambiguous: list[Section] = []
     for s in sections:
-        pre = _prefilter(s.title, s.body)
+        pre = _prefilter(s.title, _section_content(s))
         if pre is not None:
             labels[s.sid] = pre
         else:
@@ -68,7 +80,7 @@ def classify_sections(sections: list[Section], llm: LLMClient) -> dict[str, str]
     for start in range(0, len(ambiguous), _CLASSIFY_BATCH):
         chunk = ambiguous[start:start + _CLASSIFY_BATCH]
         payload = [{"id": start + j, "title": s.title,
-                    "body_preview": s.body} for j, s in enumerate(chunk)]
+                    "body_preview": _section_content(s)} for j, s in enumerate(chunk)]
         try:
             r = llm.complete(system=CLASSIFY_SYSTEM,
                              user=build_classify_user(payload),

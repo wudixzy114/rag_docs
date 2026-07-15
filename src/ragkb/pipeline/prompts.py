@@ -236,6 +236,44 @@ def build_review_user(items: list[dict]) -> str:
     return REVIEW_USER.format(items="\n\n".join(blocks))
 
 
+# ------------------------------------------------------- SOP review (L2) ----
+SOP_REVIEW_VERSION = "v1"
+
+SOP_REVIEW_SYSTEM = """你是诊断知识库的流程文档质量审核专家。请逐篇对照原始材料审核 SOP，重点检查：
+
+1. 忠实性：正文中的事实、命令、参数、版本、路径和结论必须有原文依据，不能张冠李戴或编造。
+2. 完整性：原文中的必要步骤、先后顺序、前置条件、分支、例外和警告不得遗漏，也不能截断。
+3. 可执行性：步骤表述明确，代码块和 Markdown 结构完整，读者无需返回原文即可执行。
+4. 入口问题：每条都必须能由该 SOP 回答，不能引入原文没有的新故障场景或结论。
+
+判定 verdict：
+- "pass"：可直接发布。
+- "revise"：主体有依据，但存在可修复的遗漏、含混或入口问题偏差。
+- "reject"：有编造、张冠李戴、严重缺步骤或答非所问。
+
+只输出 JSON 数组，不要解释。"""
+
+SOP_REVIEW_USER = """审核下列 SOP。返回 JSON 数组，必须覆盖所有 id：
+{{"id": <数字>, "verdict": "pass|revise|reject", "reason": "<不超过40字>",
+  "valid_entry_questions": ["<从输入入口问题中逐字复制审核通过的项；不得新增>"]}}
+
+{items}"""
+
+
+def build_sop_review_user(items: list[dict]) -> str:
+    blocks = []
+    for it in items:
+        source = (it.get("source") or "").strip()[:16000]
+        markdown = (it.get("markdown") or "").strip()[:20000]
+        blocks.append(
+            f'--- id={it["id"]}\n'
+            f'title: {it["title"]}\n'
+            f'entry_questions: {it.get("entry_questions", [])}\n'
+            f'SOP:\n{markdown}\n'
+            f'原始材料:\n{source}')
+    return SOP_REVIEW_USER.format(items="\n\n".join(blocks))
+
+
 # ------------------------------------------------------- paraphrase keys -----
 PARAPHRASE_VERSION = "v2"
 
@@ -282,4 +320,19 @@ def build_regenerate_user(items: list[dict]) -> str:
     import json
     return ("逐条修复并覆盖所有 id。返回 JSON 数组："
             '[{"id":0,"query":"用户问题","answer":"完整且忠于原文的回答"}]。\n'
+            "输入：" + json.dumps(items, ensure_ascii=False, separators=(",", ":")))
+
+
+SOP_REGENERATE_VERSION = "v1"
+
+SOP_REGENERATE_SYSTEM = """你是知识库 SOP 修复专家。上一版 SOP 未通过审核，你必须仅依据给定原始材料重新整编。
+完整保留必要步骤、顺序、条件、分支、例外、警告、命令、参数、版本和路径；禁止引入材料外事实。
+入口问题只能描述该材料确实能回答的意图。只输出 JSON。"""
+
+
+def build_sop_regenerate_user(items: list[dict]) -> str:
+    import json
+    return ("逐篇修复并覆盖所有 id。返回 JSON 数组："
+            '[{"id":0,"markdown":"含标题的完整 Markdown",'
+            '"entry_questions":["用户问题1","用户问题2"]}]。\n'
             "输入：" + json.dumps(items, ensure_ascii=False, separators=(",", ":")))

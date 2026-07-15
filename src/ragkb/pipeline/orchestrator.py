@@ -37,7 +37,10 @@ from ragkb.pipeline.events import EventBus
 from ragkb.pipeline.extract import extract_qa, extract_qa_sections, extract_sop
 from ragkb.pipeline.gate_struct import gate_qa, gate_sop
 from ragkb.pipeline.paraphrase import add_paraphrases_batch
-from ragkb.pipeline.regenerate import review_with_regeneration
+from ragkb.pipeline.regenerate import (
+    review_sop_with_regeneration,
+    review_with_regeneration,
+)
 from ragkb.pipeline.sections import split_oversize_sections
 from ragkb.pipeline.units import QAUnit, SOPUnit
 from ragkb.pipeline.vision import vision_read_image
@@ -167,8 +170,10 @@ class Orchestrator:
                 gate_sop(u)
             qa = self._retry_truncated_qa(doc, secs, labels, qa)
             sop = self._retry_truncated_sop(doc, secs, sop)
+            self._assert_extraction_coverage(secs, labels, qa, sop)
             self.bus.publish("stage", topic, stage="validate", status="done",
-                             detail=f"{sum(u.struct_ok for u in qa)} QA valid")
+                             detail=(f"{sum(u.struct_ok for u in qa)} QA / "
+                                     f"{sum(u.struct_ok for u in sop)} SOP valid"))
             # Optional experiment only; the production path remains source-faithful.
             ok_units = [u for u in qa if u.struct_ok]
             if self.settings.enable_paraphrases and ok_units:
@@ -225,6 +230,26 @@ class Orchestrator:
             self.bus.publish("log", doc.topic,
                              message=f"retried truncated SOP section {sid}")
         return good
+
+    @staticmethod
+    def _assert_extraction_coverage(secs, labels, qa, sop) -> None:
+        """Every non-skip source section must yield a structurally valid unit.
+
+        An empty extraction or a structurally broken retry is a visible document
+        failure, not a successful partial result. This is the deterministic
+        completeness invariant behind the exported knowledge base.
+        """
+        qa_sids = {p.section_sid for u in qa if u.struct_ok for p in u.sources}
+        sop_sids = {p.section_sid for u in sop if u.struct_ok for p in u.sources}
+        gaps = []
+        for section in secs:
+            label = labels.get(section.sid, "qa")
+            if label == "qa" and section.sid not in qa_sids:
+                gaps.append(f"{section.sid}:qa")
+            elif label == "sop" and section.sid not in sop_sids:
+                gaps.append(f"{section.sid}:sop")
+        if gaps:
+            raise ValueError("extraction coverage gap: " + ", ".join(gaps))
 
     def _publish_units(self, topic, qa, sop):
         for u in qa:
@@ -301,7 +326,7 @@ class Orchestrator:
             self._running = False
 
     def _consolidate(self) -> None:
-        """Cross-file aggregate + semantic review + dedup over the union of all QA."""
+        """Aggregate, semantically review, and dedup all publishable units."""
         all_qa: list[QAUnit] = []
         for res in self._results.values():
             all_qa.extend([u for u in res.qa if u.struct_ok])
@@ -317,6 +342,16 @@ class Orchestrator:
 
         review_with_regeneration(
             pending_review, self.llm,
+            max_attempts=self.settings.review_regeneration_attempts,
+            reviewer_model=self.settings.reviewer_model or None,
+            on_stage=_review_stage)
+
+        all_sop = [u for res in self._results.values() for u in res.sop if u.struct_ok]
+        pending_sop_review = [u for u in all_sop if u.semantic_ok is None]
+        self.bus.publish(
+            "log", message=f"reviewing {len(pending_sop_review)} changed SOP units")
+        review_sop_with_regeneration(
+            pending_sop_review, self.llm,
             max_attempts=self.settings.review_regeneration_attempts,
             reviewer_model=self.settings.reviewer_model or None,
             on_stage=_review_stage)
@@ -350,7 +385,8 @@ class Orchestrator:
                 passed=sum(1 for u in res.qa if u.publication_status == "approved"),
                 rejected=rejected_by_topic.get(topic, 0),
                 needs_review=sum(1 for u in res.qa if u.needs_review),
-                sop_count=len(res.sop))
+                sop_count=sum(1 for u in res.sop
+                              if u.struct_ok and u.semantic_ok is not False))
         # Stash the fully consolidated set for export.
         self._consolidated_qa = deduped
 
@@ -387,6 +423,13 @@ class Orchestrator:
                     "title": u.title, "markdown": u.markdown,
                     "entry_questions": u.entry_questions,
                     "struct_ok": u.struct_ok,
+                    "struct_reason": u.struct_reason,
+                    "semantic_ok": u.semantic_ok,
+                    "semantic_reason": u.semantic_reason,
+                    "needs_review": u.needs_review,
+                    "review_attempts": u.review_attempts,
+                    "publication_status": u.publication_status,
+                    "review_history": u.review_history,
                     "sources": [s.to_dict(include_excerpt=True) for s in u.sources]})
         tmp = out.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), "utf-8")

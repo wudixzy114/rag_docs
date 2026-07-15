@@ -16,7 +16,7 @@ import hashlib
 import logging
 
 from ragkb.llm.client import LLMClient, LLMError, LLMQuotaError, VisionImage
-from ragkb.parse.model import Document, Image
+from ragkb.parse.model import Image
 from ragkb.pipeline.prompts import VISION_VERSION, VISION_SYSTEM, build_vision_user
 from ragkb.pipeline.scrub import mask
 from ragkb.store.cache import Cache, key_for
@@ -24,6 +24,7 @@ from ragkb.store.cache import Cache, key_for
 log = logging.getLogger(__name__)
 
 _VISION_MAX_TOKENS = 4096
+_VISION_RETRY_MAX_TOKENS = 12288
 
 
 def _parse_vision(text: str) -> tuple[str, str]:
@@ -43,9 +44,15 @@ def _parse_vision(text: str) -> tuple[str, str]:
 
 
 def vision_read_image(img: Image, llm: LLMClient, cache: Cache,
-                      model: str | None = None) -> dict:
+                      model: str | None = None,
+                      max_tokens: int = _VISION_MAX_TOKENS,
+                      retry_max_tokens: int | None = _VISION_RETRY_MAX_TOKENS) -> dict:
     """Transcribe one image. Returns {transcript, meaning, model, truncated}.
-    Cached by image content + model + prompt version. Fills img.vision_text."""
+    Cached by image content + model + prompt version. Fills img.vision_text.
+
+    A length-truncated transcription is retried once with a larger completion
+    budget. If that retry is also truncated, fail the image read instead of
+    exposing a partial transcript to extraction."""
     if not img.exists:
         return {"transcript": "", "meaning": "", "model": "", "truncated": False,
                 "error": "image file missing"}
@@ -58,37 +65,48 @@ def vision_read_image(img: Image, llm: LLMClient, cache: Cache,
         return cached
 
     vi = VisionImage(data=img.data_bytes(), media_type=img.media_type())
-    try:
-        r = llm.complete_vision(
-            system=VISION_SYSTEM,
-            user=build_vision_user(mask(img.inline_ocr)),
-            images=[vi], max_tokens=_VISION_MAX_TOKENS, task="vision", model=model)
-    except LLMQuotaError as exc:
-        # Every vision-capable model is quota-exhausted. Do NOT fabricate and do
-        # NOT fall back to a text model — record the image as unread so the
-        # orchestrator can retry later. Not cached (transient).
-        log.warning("vision quota exhausted for %s; leaving unread", img.rel_path)
-        img.vision_failed = True
-        return {"transcript": "", "meaning": "", "model": "", "truncated": False,
-                "error": "vision_quota_exhausted"}
-    except LLMError as exc:
-        log.warning("vision read failed for %s: %s", img.rel_path, exc)
-        img.vision_failed = True
-        return {"transcript": "", "meaning": "", "model": "", "truncated": False,
-                "error": str(exc)}
+    budgets = [max_tokens]
+    if retry_max_tokens is not None and retry_max_tokens > max_tokens:
+        budgets.append(retry_max_tokens)
 
-    transcript, meaning = _parse_vision(r.text)
-    result = {
-        "transcript": transcript,
-        "meaning": meaning,
-        "model": r.model,
-        # finish_reason == length means the transcription was cut off — a
-        # structural defect the user explicitly forbids. Surface it so the
-        # orchestrator can re-run with a bigger budget rather than caching a
-        # half-image silently.
-        "truncated": r.finish_reason == "length",
-    }
-    if not result["truncated"]:
+    for attempt, budget in enumerate(budgets):
+        try:
+            r = llm.complete_vision(
+                system=VISION_SYSTEM,
+                user=build_vision_user(mask(img.inline_ocr)),
+                images=[vi], max_tokens=budget, task="vision", model=model)
+        except LLMQuotaError:
+            # Every vision-capable model is quota-exhausted. Do NOT fabricate and
+            # do NOT fall back to a text model. This transient result is not cached.
+            log.warning("vision quota exhausted for %s; leaving unread", img.rel_path)
+            img.vision_failed = True
+            return {"transcript": "", "meaning": "", "model": "",
+                    "truncated": False, "error": "vision_quota_exhausted"}
+        except LLMError as exc:
+            log.warning("vision read failed for %s: %s", img.rel_path, exc)
+            img.vision_failed = True
+            return {"transcript": "", "meaning": "", "model": "",
+                    "truncated": False, "error": str(exc)}
+
+        transcript, meaning = _parse_vision(r.text)
+        truncated = r.finish_reason == "length"
+        if truncated and attempt + 1 < len(budgets):
+            log.warning("vision transcription truncated for %s at %d tokens; retrying at %d",
+                        img.rel_path, budget, budgets[attempt + 1])
+            continue
+        if truncated:
+            # Do not let Image.best_text select a half transcript. Raising aborts
+            # this document run, and the orchestrator preserves its last good snapshot.
+            img.vision_text = ""
+            img.vision_failed = True
+            raise LLMError(
+                f"vision transcription still truncated after retry [{img.rel_path}]")
+
+        result = {"transcript": transcript, "meaning": meaning,
+                  "model": r.model, "truncated": False}
         cache.put("vision", ck, result)
-    img.vision_text = transcript
-    return result
+        img.vision_text = transcript
+        img.vision_failed = False
+        return result
+
+    raise AssertionError("vision token budget list must not be empty")

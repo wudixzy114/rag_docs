@@ -1,9 +1,8 @@
-"""Layer 2 — semantic quality gate (strong model, cross-reviewed, fail-closed).
+"""Layer 2 — QA and SOP semantic quality gates (strong model, fail-closed).
 
-Where Layer 1 catches structural corruption for free, Layer 2 judges CONTENT: is
-the answer accurate, unambiguous, complete, and on-topic? This is the gate the
-user asked to be model-driven ("用另一个很强的模型去审核"), and every unit is
-reviewed (the doc set is small, so no sampling).
+Where Layer 1 catches structural corruption for free, Layer 2 judges CONTENT:
+is the QA answer or SOP accurate, unambiguous, complete, and on-topic? Every
+unit is reviewed against its source evidence; there is no sampling.
 
 Design:
 - Size-bounded indexed batches turn N calls into a small number of calls without
@@ -24,8 +23,13 @@ from dataclasses import dataclass
 from ragkb.llm.client import LLMClient, LLMError, LLMQuotaError
 from ragkb.pipeline.batching import pack_by_size
 from ragkb.pipeline.jsonutil import parse_json_array
-from ragkb.pipeline.prompts import REVIEW_SYSTEM, build_review_user
-from ragkb.pipeline.units import QAUnit
+from ragkb.pipeline.prompts import (
+    REVIEW_SYSTEM,
+    SOP_REVIEW_SYSTEM,
+    build_review_user,
+    build_sop_review_user,
+)
+from ragkb.pipeline.units import QAUnit, SOPUnit
 
 log = logging.getLogger(__name__)
 
@@ -41,14 +45,14 @@ class _Verdict:
     valid_paraphrases: list[str] | None = None
 
 
-def _source_text(unit: QAUnit) -> str:
+def _source_text(unit: QAUnit | SOPUnit, max_chars: int = 12000) -> str:
     """Grounding evidence, including the source excerpt rather than headings only."""
     parts = []
     for p in unit.sources:
         excerpt = p.source_excerpt.strip()
         parts.append(f"[{p.heading_path or p.doc_title}]\n{excerpt}" if excerpt
                      else f"[{p.heading_path or p.doc_title}]（原文缺失）")
-    return "\n\n".join(parts)[:12000]
+    return "\n\n".join(parts)[:max_chars]
 
 
 def _run_batch(indexed: list[tuple[int, QAUnit]], llm: LLMClient,
@@ -191,3 +195,136 @@ def _mark_skipped(units: list[QAUnit]) -> None:
             u.needs_review = True
             u.publication_status = "failed_review"
             u.semantic_reason = "review_unavailable:no_quota"
+
+
+# ------------------------------------------------------------------- SOP ----
+_SOP_REVIEW_BATCH = 4
+_SOP_REVIEW_MAX_CHARS = 52000
+_SOP_REVIEW_MAX_TOKENS = 4096
+
+
+@dataclass
+class _SOPVerdict:
+    verdict: str
+    reason: str
+    valid_entry_questions: list[str] | None = None
+
+
+def _run_sop_batch(indexed: list[tuple[int, SOPUnit]], llm: LLMClient,
+                   model: str | None = None) -> dict[int, _SOPVerdict]:
+    items = [{"id": i, "title": u.title, "markdown": u.markdown,
+              "entry_questions": u.entry_questions,
+              "source": _source_text(u, max_chars=16000)} for i, u in indexed]
+    result = llm.complete(
+        system=SOP_REVIEW_SYSTEM, user=build_sop_review_user(items),
+        max_tokens=_SOP_REVIEW_MAX_TOKENS, task="review", model=model)
+    return _parse_sop_verdicts(result.text)
+
+
+def _parse_sop_verdicts(text: str) -> dict[int, _SOPVerdict]:
+    arr = parse_json_array(text) or []
+    out: dict[int, _SOPVerdict] = {}
+    for el in arr:
+        if not isinstance(el, dict) or "id" not in el:
+            continue
+        try:
+            idx = int(el["id"])
+        except (TypeError, ValueError):
+            continue
+        verdict = str(el.get("verdict", "")).lower()
+        if verdict not in ("pass", "revise", "reject"):
+            continue
+        valid = el.get("valid_entry_questions")
+        valid = ([str(v).strip() for v in valid if str(v).strip()]
+                 if isinstance(valid, list) else None)
+        out[idx] = _SOPVerdict(
+            verdict=verdict, reason=str(el.get("reason", "")),
+            valid_entry_questions=valid)
+    return out
+
+
+def review_sop(units: list[SOPUnit], llm: LLMClient,
+               model: str | None = None) -> list[SOPUnit]:
+    """Review every SOP against its source evidence, fail-closed.
+
+    Missing/invalid verdicts and reviewer errors cannot approve an SOP. A quota
+    failure preserves the candidate in results.json for manual recovery but marks
+    it failed_review so neither export path can publish it.
+    """
+    if not units:
+        return units
+    indexed = list(enumerate(units))
+    chunks = pack_by_size(
+        indexed,
+        lambda pair: (len(pair[1].title) + len(pair[1].markdown)
+                      + len(_source_text(pair[1], max_chars=16000))),
+        max_items=_SOP_REVIEW_BATCH, max_chars=_SOP_REVIEW_MAX_CHARS)
+
+    verdicts: dict[int, _SOPVerdict] = {}
+    for chunk_no, chunk in enumerate(chunks):
+        try:
+            batch_verdicts = _run_sop_batch(chunk, llm, model=model)
+        except LLMQuotaError:
+            log.warning("reviewer quota exhausted; skipping SOP semantic review for "
+                        "remaining %d units", sum(len(c) for c in chunks[chunk_no:]))
+            _apply_known_sop(units, verdicts)
+            _mark_skipped_sop(units)
+            return units
+        except LLMError as exc:
+            log.warning("SOP review batch failed (%d items): %s", len(chunk), exc)
+            batch_verdicts = {}
+        verdicts.update(batch_verdicts)
+
+        missing = [pair for pair in chunk if pair[0] not in batch_verdicts]
+        if missing:
+            try:
+                verdicts.update(_run_sop_batch(missing, llm, model=model))
+            except LLMQuotaError:
+                _apply_known_sop(units, verdicts)
+                _mark_skipped_sop(units)
+                return units
+            except LLMError as exc:
+                log.warning("SOP review repair failed (%d items): %s", len(missing), exc)
+
+    for i, unit in indexed:
+        result = verdicts.get(i)
+        if result is None:
+            unit.semantic_ok = False
+            unit.needs_review = True
+            unit.publication_status = "failed_review"
+            unit.semantic_reason = "no_verdict"
+            continue
+        _apply_sop_verdict(unit, result)
+    return units
+
+
+def _apply_sop_verdict(unit: SOPUnit, result: _SOPVerdict) -> None:
+    unit.semantic_reason = f"{result.verdict}:{result.reason}"
+    allowed = set(result.valid_entry_questions or [])
+    unit.entry_questions = [q for q in unit.entry_questions if q in allowed]
+    if result.verdict == "pass" and unit.entry_questions:
+        unit.semantic_ok = True
+        unit.needs_review = False
+        unit.publication_status = "approved"
+    else:
+        unit.semantic_ok = False
+        unit.needs_review = True
+        unit.publication_status = "failed_review"
+        if result.verdict == "pass":
+            unit.semantic_reason = "revise:no_valid_entry_questions"
+
+
+def _apply_known_sop(units: list[SOPUnit],
+                     verdicts: dict[int, _SOPVerdict]) -> None:
+    for idx, result in verdicts.items():
+        if 0 <= idx < len(units):
+            _apply_sop_verdict(units[idx], result)
+
+
+def _mark_skipped_sop(units: list[SOPUnit]) -> None:
+    for unit in units:
+        if unit.semantic_ok is None:
+            unit.semantic_ok = False
+            unit.needs_review = True
+            unit.publication_status = "failed_review"
+            unit.semantic_reason = "review_unavailable:no_quota"

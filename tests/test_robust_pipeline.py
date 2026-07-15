@@ -8,17 +8,21 @@ import pytest
 from pathlib import Path
 
 from ragkb.config import LLMSettings
-from ragkb.llm.client import LLMResult, LLMUsage, LLMClient
+from ragkb.llm.client import LLMError, LLMResult, LLMUsage, LLMClient
+from ragkb.parse.model import Image, Section
 from ragkb.parse.markdown import parse_document
 from ragkb.parse.source import load_source, source_bundle_sha
 from ragkb.pipeline.batching import pack_by_size
-from ragkb.pipeline.gate_semantic import review_qa
+from ragkb.pipeline.classify import classify_sections
+from ragkb.pipeline.gate_semantic import review_qa, review_sop
 from ragkb.pipeline.extract import extract_qa
-from ragkb.pipeline.regenerate import review_with_regeneration
-from ragkb.pipeline.orchestrator import discover_topics
+from ragkb.pipeline.regenerate import review_sop_with_regeneration, review_with_regeneration
+from ragkb.pipeline.orchestrator import Orchestrator, discover_topics
 from ragkb.pipeline.sections import split_oversize_sections
-from ragkb.pipeline.units import Provenance, QAUnit
+from ragkb.pipeline.units import Provenance, QAUnit, SOPUnit
+from ragkb.pipeline.vision import vision_read_image
 from ragkb.server.app import _public_results
+from ragkb.store.cache import Cache
 
 
 def test_headerless_document_is_not_dropped(tmp_path):
@@ -91,6 +95,68 @@ def test_size_batching_and_long_section_split_keep_fences():
                                     max_chars=100)
     assert len(parts) >= 2
     assert all(p.body.count("```") % 2 == 0 for p in parts)
+
+
+class _ClassifyImageLLM:
+    def complete(self, **kwargs):
+        assert "CUDA out of memory" in kwargs["user"]
+        return LLMResult(text='[{"id":0,"label":"qa","reason":"报错截图"}]')
+
+
+def test_screenshot_only_section_is_classified_from_vision_text(tmp_path):
+    image = Image(rel_path="images/error.png", abs_path=tmp_path / "error.png",
+                  vision_text="CUDA out of memory")
+    section = Section(level=1, title="运行截图", body="", images=[image], sid="1")
+    assert classify_sections([section], _ClassifyImageLLM()) == {"1": "qa"}
+
+
+def test_extraction_coverage_gap_is_a_visible_failure():
+    section = Section(level=1, title="问题", body="有效内容", sid="1")
+    with pytest.raises(ValueError, match="1:qa"):
+        Orchestrator._assert_extraction_coverage(
+            [section], {"1": "qa"}, [], [])
+
+    unit = QAUnit(query="怎么处理", answer="执行命令",
+                  sources=[Provenance(section_sid="1")])
+    Orchestrator._assert_extraction_coverage(
+        [section], {"1": "qa"}, [unit], [])
+
+
+class _VisionLLM:
+    def __init__(self, results):
+        self.results = list(results)
+        self.budgets = []
+
+    def complete_vision(self, **kwargs):
+        self.budgets.append(kwargs["max_tokens"])
+        return self.results.pop(0)
+
+
+def test_vision_truncation_retries_with_larger_budget(tmp_path):
+    path = tmp_path / "screen.png"
+    path.write_bytes(b"image")
+    image = Image(rel_path="screen.png", abs_path=path)
+    llm = _VisionLLM([
+        LLMResult(text="[TRANSCRIPT]\n半张图", finish_reason="length"),
+        LLMResult(text="[TRANSCRIPT]\n完整转写\n[MEANING]\n日志截图", model="vision"),
+    ])
+    result = vision_read_image(image, llm, Cache(tmp_path / "cache"))
+    assert llm.budgets == [4096, 12288]
+    assert result["transcript"] == "完整转写"
+    assert image.vision_text == "完整转写" and not image.vision_failed
+
+
+def test_vision_second_truncation_fails_closed(tmp_path):
+    path = tmp_path / "screen.png"
+    path.write_bytes(b"image")
+    image = Image(rel_path="screen.png", abs_path=path)
+    llm = _VisionLLM([
+        LLMResult(text="[TRANSCRIPT]\n半张图", finish_reason="length"),
+        LLMResult(text="[TRANSCRIPT]\n仍然半张", finish_reason="length"),
+    ])
+    with pytest.raises(LLMError, match="still truncated"):
+        vision_read_image(image, llm, Cache(tmp_path / "cache"))
+    assert image.vision_text == "" and image.vision_failed
 
 
 class _ReviewLLM:
@@ -171,6 +237,49 @@ def test_review_failure_after_one_regeneration_is_retained_and_marked():
     assert unit.publication_status == "failed_review"
     assert unit.needs_review is True
     assert unit.review_attempts == 1
+
+
+class _SOPReviewRegenerateLLM:
+    def __init__(self):
+        self.review_calls = 0
+
+    def complete(self, **kwargs):
+        if "SOP 修复专家" in kwargs["system"]:
+            return LLMResult(text='[{"id":0,"markdown":"# 完整流程\\n1. 执行 A\\n2. 执行 B",'
+                                   '"entry_questions":["完整流程怎么做？"]}]')
+        self.review_calls += 1
+        verdict = "reject" if self.review_calls == 1 else "pass"
+        return LLMResult(text=f'[{{"id":0,"verdict":"{verdict}","reason":"check",'
+                               '"valid_entry_questions":["完整流程怎么做？"]}]')
+
+
+def test_sop_review_regenerates_and_rechecks_against_source():
+    unit = SOPUnit(
+        title="完整流程", markdown="# 完整流程\n1. 执行 A",
+        entry_questions=["完整流程怎么做？"],
+        sources=[Provenance(topic="t", source_excerpt="1. 执行 A\n2. 执行 B")])
+    llm = _SOPReviewRegenerateLLM()
+    review_sop_with_regeneration([unit], llm, max_attempts=1)
+    assert llm.review_calls == 2
+    assert unit.semantic_ok is True
+    assert unit.publication_status == "approved"
+    assert unit.review_attempts == 1
+    assert "执行 B" in unit.markdown
+
+
+class _SOPReviewMissingQuestionsLLM:
+    def complete(self, **kwargs):
+        return LLMResult(text='[{"id":0,"verdict":"pass","reason":"ok"}]')
+
+
+def test_sop_review_cannot_pass_without_reviewed_entry_questions():
+    unit = SOPUnit(title="流程", markdown="# 流程\n1. 执行 A",
+                   entry_questions=["流程怎么做？"],
+                   sources=[Provenance(source_excerpt="1. 执行 A")])
+    review_sop([unit], _SOPReviewMissingQuestionsLLM())
+    assert unit.semantic_ok is False
+    assert unit.publication_status == "failed_review"
+    assert unit.semantic_reason == "revise:no_valid_entry_questions"
 
 
 class _InvalidJSONLLM:
