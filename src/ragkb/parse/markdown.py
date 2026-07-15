@@ -143,6 +143,20 @@ def _consume_ocr_block(lines: list[str], start: int) -> tuple[int, str]:
     while i < n:
         ln = lines[i]
         low = ln.strip().lower()
+        # A line may pack <pre>…</pre></details><tail> together. Detect an inline
+        # </details> on THIS line (after any </pre>) so a glued trailing image
+        # directive is handed back to the main loop rather than skipped.
+        if not in_pre and "<pre" in low and "</details>" in low:
+            after = ln.split(">", 1)[1] if ">" in ln else ""
+            if "</pre>" in after:
+                ocr_lines.append(after.split("</pre>")[0])
+            _det = re.split(r"</details>", ln, maxsplit=1, flags=re.I)
+            tail = _det[1] if len(_det) > 1 else ""
+            ocr_text = _unescape("\n".join(ocr_lines)).strip()
+            if tail.strip():
+                lines[i] = tail
+                return i, ocr_text
+            return i + 1, ocr_text
         if "<pre" in low:
             in_pre = True
             after = ln.split(">", 1)[1] if ">" in ln else ""
@@ -163,7 +177,18 @@ def _consume_ocr_block(lines: list[str], start: int) -> tuple[int, str]:
             i += 1
             continue
         if "</details>" in low:
-            return i + 1, _unescape("\n".join(ocr_lines)).strip()
+            # Preserve any content glued AFTER </details> on the same line
+            # (e.g. `</details>![](images/img-10.png)` — the next image directive).
+            # Returning i+1 would skip that whole line and silently drop the image.
+            # Rewrite the line to just its trailing part and hand the SAME index
+            # back so the main loop reprocesses it (image scan, heading, etc.).
+            parts = re.split(r"</details>", ln, maxsplit=1, flags=re.I)
+            tail = parts[1] if len(parts) > 1 else ""
+            ocr_text = _unescape("\n".join(ocr_lines)).strip()
+            if tail.strip():
+                lines[i] = tail
+                return i, ocr_text
+            return i + 1, ocr_text
         i += 1
     return i, _unescape("\n".join(ocr_lines)).strip()
 

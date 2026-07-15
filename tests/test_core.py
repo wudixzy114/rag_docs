@@ -44,6 +44,22 @@ def test_ocr_block_lifted_from_body(tmp_path):
     assert "正文段落" in sec.body
 
 
+def test_image_directive_glued_to_details_close(tmp_path):
+    """An image directive glued onto the previous OCR block's `</details>` line
+    (`</details>![](img-10.png)`) must still be parsed — the OCR-block consumer
+    must not swallow the trailing image. Regression: img-10 was silently dropped."""
+    md = ("# 标题\n\n![](images/img-09.png)\n\n"
+          "<!-- ocr-source: images/img-09.png -->\n<details>\n<pre>GPU图</pre>"
+          "</details>![](images/img-10.png)\n\n"
+          "<!-- ocr-source: images/img-10.png -->\n<details>\n<pre>CPU图</pre>\n</details>\n\n正文\n")
+    doc = parse_document(_write(tmp_path, md))
+    paths = [im.rel_path for im in doc.all_images()]
+    assert "images/img-09.png" in paths and "images/img-10.png" in paths   # both survive
+    sec = next(s for s in doc.iter_sections() if s.title == "标题")
+    ocr = {im.rel_path: im.inline_ocr for im in sec.images}
+    assert ocr["images/img-09.png"] == "GPU图" and ocr["images/img-10.png"] == "CPU图"  # not misrouted
+
+
 def test_struct_gate_rejects_truncation_and_empty():
     good = gate_qa(QAUnit(query="怎么办", answer="这样做即可"))
     assert good.struct_ok
