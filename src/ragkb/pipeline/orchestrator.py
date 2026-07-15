@@ -273,9 +273,17 @@ class Orchestrator:
         seen = set()
         for res in self._results.values():
             for u in res.qa:
-                if u.unit_id in seen:
+                # Dedup key is (module, unit_id), NOT unit_id alone: dedup_qa keeps
+                # cross-module twins on purpose (same question, module-specific
+                # answer — user's recall-first rule). Keying on unit_id (a hash of
+                # the query only) would collapse those twins and silently drop one
+                # module's distinct answer here, diverging results.json from the
+                # exported set.
+                mod = u.sources[0].topic if u.sources else ""
+                key = (mod, u.unit_id)
+                if key in seen:
                     continue
-                seen.add(u.unit_id)
+                seen.add(key)
                 payload["qa"].append({
                     "query": u.query, "answer": u.answer,
                     "paraphrases": u.paraphrases,

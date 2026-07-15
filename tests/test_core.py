@@ -100,6 +100,92 @@ def test_export_csv_three_columns_with_module(tmp_path):
     assert (tmp_path / "by_module" / "05_9Nctl常见问题汇总" / "qa_pairs.csv").is_file()
 
 
+def test_sop_filename_is_module_plus_section_number(tmp_path):
+    """SOP filenames drop the long title and key on the section NUMBER (upload
+    target caps path length). Long descriptive titles must not blow up the name."""
+    long_title = ("7.4.7. 关闭 SampleService 断点续训时，同时关闭 sample dispatcher "
+                  "的 checkpoint 配置以避免状态不一致")
+    u = SOPUnit(title=long_title, markdown="# x\n步骤", entry_questions=["怎么做"],
+                sources=[Provenance(topic="10_9N-Tritium")])
+    export_all([], [u], tmp_path)
+    files = list((tmp_path / "sop").glob("*.md"))
+    assert len(files) == 1
+    assert files[0].name == "10_9N-Tritium__7.4.7.md"
+    assert len(files[0].stem) <= 25          # was 80+ under the old title-based scheme
+
+
+def test_entry_questions_injected_inside_first_heading(tmp_path):
+    """Entry-questions must live INSIDE the doc (after the first `#`), never as a
+    pre-heading block — else the vector service chunks them into an answer-less
+    orphan chunk. Guarantee: nothing precedes the `#`, and the 问法 line sits in
+    the same (first) chunk as the title."""
+    md = "# 代理服务的配置\n\n在集群中要访问 tensorboard 需先配置代理。\n\n## 步骤\n1. 打开插件"
+    u = SOPUnit(title="4.1.1. 代理服务的配置", markdown=md,
+                entry_questions=["tensorboard 访问不了？", "怎么配代理？"],
+                sources=[Provenance(topic="01_模型训练常见问题自查")])
+    export_all([], [u], tmp_path)
+    text = (tmp_path / "sop" / "01_模型训练常见问题自查__4.1.1.md").read_text("utf-8")
+    # The document opens with the H1 — no orphan block before it.
+    assert text.lstrip().startswith("# 代理服务的配置")
+    assert "<!-- entry-questions" not in text          # old orphan format gone
+    # 问法 appears after the H1 but before the first ## (i.e. in the first chunk).
+    i_h1 = text.index("# 代理服务的配置")
+    i_q = text.index("常见问法")
+    i_h2 = text.index("## 步骤")
+    assert i_h1 < i_q < i_h2
+    assert "tensorboard 访问不了？" in text and "怎么配代理？" in text
+
+
+def test_sop_filename_fallback_and_collision(tmp_path):
+    """Unnumbered pages get a compact FAQ/slug; a repeated key never overwrites."""
+    faq = SOPUnit(title="【FAQ】任务优先级规则说明", markdown="# a\n内容",
+                  entry_questions=["怎么排优先级"], sources=[Provenance(topic="03_任务优先级规则说明")])
+    dup1 = SOPUnit(title="1. 步骤", markdown="# b\n内容一", entry_questions=["q1"],
+                   sources=[Provenance(topic="06_批调度")])
+    dup2 = SOPUnit(title="1. 另一节", markdown="# c\n内容二", entry_questions=["q2"],
+                   sources=[Provenance(topic="06_批调度")])   # same module+number → collision
+    export_all([], [faq, dup1, dup2], tmp_path)
+    names = {p.name for p in (tmp_path / "sop").glob("*.md")}
+    assert "03_任务优先级规则说明__FAQ.md" in names
+    # both same-key SOPs survive (one suffixed), neither silently lost
+    assert "06_批调度__1.md" in names and "06_批调度__1-2.md" in names
+
+
+def test_upload_zip_utf8_and_no_dsstore(tmp_path):
+    """The zip must set the UTF-8 filename flag on CJK names (else mojibake on
+    unzip) and never bundle .DS_Store."""
+    import zipfile
+    u = QAUnit(query="问题", answer="答案", sources=[Provenance(topic="05_9Nctl常见问题汇总")])
+    s = SOPUnit(title="1. 标题", markdown="# x\n步骤", entry_questions=["怎么做"],
+                sources=[Provenance(topic="05_9Nctl常见问题汇总")])
+    (tmp_path / ".DS_Store").write_bytes(b"junk")     # must be excluded
+    export_all([u], [s], tmp_path)
+    zpath = tmp_path / "知识库上传包.zip"
+    assert zpath.is_file()
+    z = zipfile.ZipFile(zpath)
+    infos = z.infolist()
+    assert not any(".DS_Store" in i.filename for i in infos)
+    cjk = [i for i in infos if not i.filename.isascii()]
+    assert cjk and all(i.flag_bits & 0x800 for i in cjk)   # every CJK name flagged UTF-8
+
+
+def test_export_round_trips_through_results_json(tmp_path):
+    """load_results(results.json) → export_all must reproduce the same unit set,
+    including cross-module twins (the persist dedup keys on (module, unit_id))."""
+    import json
+    from ragkb.pipeline.export import load_results
+    payload = {"qa": [
+        {"query": "clone没权限怎么办", "answer": "配置SSH(LLM)", "paraphrases": ["拉代码没权限"],
+         "needs_review": False, "semantic_reason": "", "sources": [{"topic": "09_9N-LLM"}]},
+        {"query": "clone没权限怎么办", "answer": "配置SSH(Tritium)", "paraphrases": [],
+         "needs_review": False, "semantic_reason": "", "sources": [{"topic": "10_9N-Tritium"}]},
+    ], "sop": []}
+    (tmp_path / "results.json").write_text(json.dumps(payload, ensure_ascii=False), "utf-8")
+    qa, sop = load_results(tmp_path)
+    assert len(qa) == 2                    # cross-module twins both survive rehydration
+    assert {u.sources[0].topic for u in qa} == {"09_9N-LLM", "10_9N-Tritium"}
+
+
 def test_reversible_mask_restore():
     from ragkb.pipeline.scrub import Redactor
     r = Redactor()

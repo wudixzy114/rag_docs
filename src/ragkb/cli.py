@@ -54,13 +54,18 @@ def run(only: list[str] = typer.Option(None, "--only", help="只处理指定主�
 
 @app.command()
 def export():
-    """Export CSV/SOP/metadata from the last run's results.json."""
+    """Regenerate CSV/SOP/metadata/zip from the last run's results.json.
+
+    Reproducible outside the producing process: rehydrates consolidated units
+    (and the redaction map) from output/, then re-exports. Use this after hand-
+    editing results.json, or to re-run export with updated packaging logic."""
     settings = get_settings()
-    orch = Orchestrator(settings=settings)
-    # Rehydrate consolidated units from results.json isn't wired; re-run is the
-    # canonical path. Export here operates on whatever the last run left in memory
-    # only within a single process, so this command is mainly for the dashboard.
-    typer.echo("请使用 `ragkb run` 一次性处理并导出，或在仪表盘中点击导出。")
+    from ragkb.pipeline.export import export_all, load_results
+    qa, sop = load_results(settings.output_dir)
+    stats = export_all(qa, sop, settings.output_dir)
+    typer.echo(
+        f"已导出：QA单元 {stats.qa_units}，检索行 {stats.qa_rows}，"
+        f"SOP {stats.sop_files}，待复核 {stats.needs_review}，模块 {stats.modules}")
 
 
 @app.command()
