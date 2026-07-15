@@ -53,18 +53,26 @@ def run(only: list[str] = typer.Option(None, "--only", help="只处理指定主�
 
 
 @app.command()
-def export():
+def export(no_paraphrase: bool = typer.Option(
+        False, "--no-paraphrase",
+        help="额外导出无扩写版(每答案仅主query一行): qa_pairs_no_paraphrase.csv + 知识库上传包_无扩写.zip")):
     """Regenerate CSV/SOP/metadata/zip from the last run's results.json.
 
     Reproducible outside the producing process: rehydrates consolidated units
     (and the redaction map) from output/, then re-exports. Use this after hand-
-    editing results.json, or to re-run export with updated packaging logic."""
+    editing results.json, or to re-run export with updated packaging logic.
+
+    --no-paraphrase writes the SLIM variant to SEPARATE filenames (the default
+    inflated artifacts are left untouched), for a vector DB that does not dedup by
+    answer at retrieval time."""
     settings = get_settings()
     from ragkb.pipeline.export import export_all, load_results
     qa, sop = load_results(settings.output_dir)
-    stats = export_all(qa, sop, settings.output_dir)
+    stats = export_all(qa, sop, settings.output_dir,
+                       include_paraphrases=not no_paraphrase)
+    variant = "无扩写" if no_paraphrase else "含扩写"
     typer.echo(
-        f"已导出：QA单元 {stats.qa_units}，检索行 {stats.qa_rows}，"
+        f"已导出（{variant}）：QA单元 {stats.qa_units}，检索行 {stats.qa_rows}，"
         f"SOP {stats.sop_files}，待复核 {stats.needs_review}，模块 {stats.modules}")
 
 

@@ -1,12 +1,19 @@
 """Export layer — produce the vector-DB ingest artifacts.
 
 Outputs into output/:
-- `qa_pairs.csv`: three columns `Query,Answer,Module`. One row per query key (main
-  query + every paraphrase → same answer), so the recall boost materializes as
-  extra rows. `Module` is a SOFT label — the vector DB indexes globally and may
-  use it to filter/boost when the caller's module is known, but retrieval is NOT
-  hard-partitioned (a symptom query must reach every module). QUOTE_ALL +
-  utf-8-sig so CJK / commas / newlines never misalign.
+- `qa_pairs.csv`: three columns `Query,Answer,Module`. By DEFAULT one row per query
+  key (main query + every paraphrase → same answer), so the recall boost
+  materializes as extra rows. Pass `include_paraphrases=False` to emit the SLIM
+  variant instead — one row per QA unit (main query only), for the internal vector
+  DB which does NOT dedup by answer at retrieval time (there, paraphrase rows would
+  let several near-identical keys for the same answer co-occupy the top-k and crowd
+  out other answers; measured ~5x row inflation). The slim run writes to a SEPARATE
+  file `qa_pairs_no_paraphrase.csv` (+ its own zip) so the default inflated
+  artifacts are never clobbered. Paraphrases always stay in metadata.jsonl. `Module`
+  is a SOFT label — the vector DB indexes globally and may use it to filter/boost
+  when the caller's module is known, but retrieval is NOT hard-partitioned (a
+  symptom query must reach every module). QUOTE_ALL + utf-8-sig so CJK / commas /
+  newlines never misalign.
 - `by_module/<module>/qa_pairs.csv` + `by_module/<module>/sop/`: the same content
   partitioned per module, for callers that ingest one module at a time. Dedup is
   module-scoped upstream, so each module's file is self-contained.
@@ -63,9 +70,14 @@ def _module_of(u) -> str:
     return u.sources[0].topic if u.sources else "_unknown"
 
 
-def _write_qa_csv(path: Path, units: list[QAUnit]) -> int:
+def _write_qa_csv(path: Path, units: list[QAUnit],
+                  include_paraphrases: bool = True) -> int:
     """Write a Query,Answer,Module CSV. Returns row count. Values are RESTORED
-    (real MAC/IP/etc.) since the KB is internal."""
+    (real MAC/IP/etc.) since the KB is internal.
+
+    include_paraphrases=True (default): one row per query key (main + paraphrases).
+    include_paraphrases=False: one row per unit (main query only) — the slim
+    variant for a vector DB that does not dedup by answer at retrieval time."""
     rows = 0
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
@@ -74,7 +86,10 @@ def _write_qa_csv(path: Path, units: list[QAUnit]) -> int:
         for u in units:
             ans = restore(u.answer)
             mod = _module_of(u)
-            for key in u.query_keys():
+            keys = u.query_keys() if include_paraphrases else [u.query.strip()]
+            for key in keys:
+                if not key:
+                    continue
                 w.writerow([restore(key), ans, mod])
                 rows += 1
     return rows
@@ -128,20 +143,25 @@ def _write_sop(sop_dir: Path, units: list[SOPUnit]) -> int:
 
 
 def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
-               output_dir: Path) -> ExportStats:
+               output_dir: Path, include_paraphrases: bool = True) -> ExportStats:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     stats = ExportStats()
 
-    # 1. Global qa_pairs.csv (all modules, with Module column).
-    stats.qa_rows = _write_qa_csv(output_dir / "qa_pairs.csv", qa_units)
+    # Slim variant routes to its OWN filenames so the default (inflated) artifacts
+    # are never clobbered — both can coexist in output/.
+    csv_name = "qa_pairs.csv" if include_paraphrases else "qa_pairs_no_paraphrase.csv"
+    zip_name = "知识库上传包.zip" if include_paraphrases else "知识库上传包_无扩写.zip"
+
+    # 1. Global qa CSV (all modules, with Module column).
+    stats.qa_rows = _write_qa_csv(output_dir / csv_name, qa_units, include_paraphrases)
     stats.qa_units = len(qa_units)
     stats.needs_review = sum(1 for u in qa_units if u.needs_review)
 
     # 2. Global sop/ dir.
     stats.sop_files = _write_sop(output_dir / "sop", sop_units)
 
-    # 3. Per-module partition: by_module/<module>/{qa_pairs.csv, sop/}.
+    # 3. Per-module partition: by_module/<module>/{<csv_name>, sop/}.
     modules: dict[str, dict] = {}
     for u in qa_units:
         modules.setdefault(_module_of(u), {"qa": [], "sop": []})["qa"].append(u)
@@ -151,12 +171,13 @@ def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
     for mod, bucket in modules.items():
         mdir = by_module / _safe_filename(mod)
         if bucket["qa"]:
-            _write_qa_csv(mdir / "qa_pairs.csv", bucket["qa"])
+            _write_qa_csv(mdir / csv_name, bucket["qa"], include_paraphrases)
         if bucket["sop"]:
             _write_sop(mdir / "sop", bucket["sop"])
     stats.modules = len(modules)
 
     # 4. metadata.jsonl — provenance sidecar (restored values, module label).
+    #    Paraphrases are ALWAYS kept here regardless of the CSV variant.
     with (output_dir / "metadata.jsonl").open("w", encoding="utf-8") as f:
         for u in qa_units:
             rec = {
@@ -177,35 +198,51 @@ def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
         (output_dir / "redaction_map.json").write_text(
             json.dumps(audit, ensure_ascii=False, indent=2), "utf-8")
 
-    # 6. 知识库上传包.zip — the single artifact handed to the upload target.
-    _write_upload_zip(output_dir)
+    # 6. upload zip — the single artifact handed to the upload target (bundles the
+    #    matching CSV variant only).
+    _write_upload_zip(output_dir, csv_name=csv_name, zip_name=zip_name)
 
     return stats
 
 
-def _write_upload_zip(output_dir: Path) -> Path:
-    """Bundle the ingest artifacts into 知识库上传包.zip.
+def _write_upload_zip(output_dir: Path, csv_name: str = "qa_pairs.csv",
+                      zip_name: str = "知识库上传包.zip") -> Path:
+    """Bundle the ingest artifacts into the upload zip.
 
     Two things the ad-hoc Finder/`zip` package got wrong and this fixes:
     - UTF-8 filename flag (bit 0x800) MUST be set, or CJK SOP filenames arrive
       as mojibake on `unzip`. ZipInfo.flag_bits is set explicitly (Python only
       auto-sets it for non-ascii names on some versions — we don't rely on it).
     - Never include .DS_Store / caches. We whitelist exactly what ingests:
-      qa_pairs.csv, sop/, by_module/, metadata.jsonl.
+      <csv_name>, sop/, by_module/, metadata.jsonl.
+
+    csv_name selects which QA CSV variant to bundle (default vs slim); the
+    per-module glob is filtered to that SAME variant so the two never mix in one
+    zip.
     """
     import zipfile
 
-    zip_path = output_dir / "知识库上传包.zip"
+    zip_path = output_dir / zip_name
     members: list[Path] = []
-    for name in ("qa_pairs.csv", "metadata.jsonl"):
+    for name in (csv_name, "metadata.jsonl"):
         p = output_dir / name
         if p.is_file():
             members.append(p)
-    for sub in ("sop", "by_module"):
-        d = output_dir / sub
-        if d.is_dir():
-            members.extend(sorted(p for p in d.rglob("*")
-                                  if p.is_file() and p.name != ".DS_Store"))
+    # SOP dir: all of it. by_module: only the matching CSV variant + sop files
+    # (the sibling variant's per-module CSV must not leak into this zip).
+    sop_dir = output_dir / "sop"
+    if sop_dir.is_dir():
+        members.extend(sorted(p for p in sop_dir.rglob("*")
+                              if p.is_file() and p.name != ".DS_Store"))
+    by_module = output_dir / "by_module"
+    if by_module.is_dir():
+        for p in sorted(by_module.rglob("*")):
+            if not p.is_file() or p.name == ".DS_Store":
+                continue
+            # A per-module qa CSV: keep only the requested variant.
+            if p.name.endswith(".csv") and p.name != csv_name:
+                continue
+            members.append(p)
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in members:
