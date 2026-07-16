@@ -81,15 +81,24 @@ def create_app() -> FastAPI:
         # the CLI as well as this server. Fall back to in-memory history if the
         # journal isn't present yet.
         journal_events, _ = read_journal(journal_path, 0)
-        if journal_events:
-            recent = journal_events[-2000:]
-        else:
-            recent = [event.to_dict() for event in bus.history()]
+        if not journal_events:
+            journal_events = [event.to_dict() for event in bus.history()]
+        # Derive cumulative state (stages / last_run / errors) from the FULL journal,
+        # NOT a tail slice. The concurrency heartbeat fires ~1/s and dominates event
+        # volume, so a tail window would evict the early stage/run_status/doc_status
+        # events and make the dashboard's progress appear to regress. Split first:
+        # heartbeats feed only the live gauge; everything else rebuilds state.
+        concurrency = {}
+        state_events = []
+        for event in journal_events:
+            if event.get("kind") == "concurrency":
+                concurrency = {**(event.get("data") or {}), "ts": event.get("ts")}
+            else:
+                state_events.append(event)
         stages: dict[str, dict[str, dict]] = {}
         errors = []
         last_run = {}
-        concurrency = {}
-        for event in recent:
+        for event in state_events:
             kind = event.get("kind")
             topic = event.get("topic", "")
             data = event.get("data", {}) or {}
@@ -100,21 +109,19 @@ def create_app() -> FastAPI:
                 errors.append(event)
             elif kind == "run_status":
                 last_run = {**data, "seq": event.get("seq"), "ts": event.get("ts")}
-            elif kind == "concurrency":
-                concurrency = {**data, "ts": event.get("ts")}
         llm_settings = orch.llm.settings
         usage = orch.llm.total_usage
         # `running` reflects a run in ANY process: this server's own flag, or a
         # journal whose latest run_status is 'started' (e.g. a CLI run).
         running = state["running"] or last_run.get("status") == "started"
-        # Keep the high-frequency concurrency heartbeat out of the visible event
-        # feed; it's surfaced as a live gauge via `concurrency` instead.
-        feed = [e for e in recent if e.get("kind") != "concurrency"]
+        # Visible feed: only the last 300 NON-heartbeat events (state_events already
+        # excludes concurrency), so the activity panel stays useful without the gauge
+        # spam and without evicting real events.
         return JSONResponse({
             "docs": docs, "results": results, "running": running,
             "stages": stages, "errors": errors[-50:], "last_run": last_run,
             "concurrency": concurrency,
-            "events": feed[-300:],
+            "events": state_events[-300:],
             "usage": usage.__dict__,
             "models": {
                 "classify": llm_settings.model_for("classify"),
@@ -132,7 +139,16 @@ def create_app() -> FastAPI:
         import asyncio
 
         all_events, offset = read_journal(journal_path, 0)
-        backlog = all_events[-300:]
+        # Replay the last 300 NON-heartbeat events plus the single latest
+        # concurrency sample. Replaying raw tail would be ~all concurrency spam
+        # (it fires ~1/s), starving the client of the stage/doc_status events it
+        # needs to rebuild progress on (re)connect.
+        non_hb = [e for e in all_events if e.get("kind") != "concurrency"]
+        latest_hb = next((e for e in reversed(all_events)
+                          if e.get("kind") == "concurrency"), None)
+        backlog = non_hb[-300:]
+        if latest_hb is not None:
+            backlog.append(latest_hb)
 
         async def gen():
             nonlocal offset
