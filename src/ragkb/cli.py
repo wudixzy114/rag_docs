@@ -79,6 +79,23 @@ def export(with_paraphrase: bool = typer.Option(
 
 
 @app.command()
+def merge(subdir: str = typer.Option(
+        "upload_sop", help="合并文件的输出子目录（相对 output/）")):
+    """语义合并 SOP 碎片为少量可上传文件（从 results.json 重放，不耗模型配额）。
+
+    抽取产出是「每 section 一篇」，全量下上千个碎文件难以上传。此命令按语义主题
+    合并：大部头文档按顶层大章拆，其余模块整篇合。内容与 export 逐字一致（复用
+    同一渲染 + 脱敏还原），只是拼接在一起。产出到 output/<subdir>/。"""
+    settings = get_settings()
+    from ragkb.pipeline.merge import merge_sop
+    stats = merge_sop(settings.output_dir, subdir=subdir)
+    typer.echo(
+        f"已合并：{stats.sop_units} 篇 SOP（{stats.modules} 模块）→ "
+        f"{stats.files} 个文件，合计 {stats.total_chars} 字符")
+    typer.echo(f"输出目录: {settings.output_dir / subdir}")
+
+
+@app.command()
 def serve(port: int = typer.Option(8000, help="仪表盘端口"),
           host: str = typer.Option("127.0.0.1")):
     """Launch the web dashboard."""
