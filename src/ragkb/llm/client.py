@@ -140,6 +140,71 @@ class _AdaptiveConcurrencyWindow:
                     previous, self._window)
 
 
+class _PerModelWindows:
+    """A registry of independent AIMD windows, one per model.
+
+    The gateway meters its RATE limit (429 code:2003 请求次数超过模型限流阈值)
+    PER MODEL — verified empirically (scripts/probe_rate_limit.py): pushing five
+    models at once shows each model's 429 rate ≈ its solo baseline, i.e. the
+    limit buckets are independent. So one shared window needlessly throttles the
+    fleet to a single model's capacity. Giving each model its own window lets the
+    scheduler run them concurrently and sum their throughput; when one model is
+    rate-limited its window shrinks and the scheduler naturally shifts load to the
+    others.
+
+    Thread-safe: windows are created lazily under a lock; each window carries its
+    own condition variable for acquire/release.
+    """
+
+    def __init__(self, maximum: int) -> None:
+        self.maximum = max(1, maximum)
+        self._lock = threading.Lock()
+        self._by_model: dict[str, _AdaptiveConcurrencyWindow] = {}
+
+    def window(self, model: str) -> _AdaptiveConcurrencyWindow:
+        with self._lock:
+            w = self._by_model.get(model)
+            if w is None:
+                w = _AdaptiveConcurrencyWindow(self.maximum)
+                self._by_model[model] = w
+            return w
+
+    def in_flight(self, model: str) -> int:
+        """Current in-flight count for a model (0 if it has no window yet)."""
+        with self._lock:
+            w = self._by_model.get(model)
+        return w.stats()["in_flight"] if w is not None else 0
+
+    def headroom(self, model: str) -> float:
+        """Free capacity = limit - in_flight for a model. A model with no window
+        yet is fully idle (headroom = maximum), so it gets picked first. Higher =
+        more room to take new work."""
+        with self._lock:
+            w = self._by_model.get(model)
+        if w is None:
+            return float(self.maximum)
+        s = w.stats()
+        return s["limit"] - s["in_flight"]
+
+    def aggregate_stats(self) -> dict:
+        """Fleet-wide snapshot for the dashboard: total in-flight across all
+        models + per-model breakdown. Sums the independent windows so the gauge
+        shows the real aggregate concurrency the multi-model scheduler achieves."""
+        with self._lock:
+            items = list(self._by_model.items())
+        per = {m: w.stats() for m, w in items}
+        total_in_flight = sum(s["in_flight"] for s in per.values())
+        total_limit = sum(s["limit"] for s in per.values())
+        return {
+            "in_flight": total_in_flight,
+            "limit": total_limit,
+            "window": total_limit,
+            "maximum": self.maximum * max(1, len(per)),
+            "per_model": per,
+            "active_models": len(per),
+        }
+
+
 def _drop_rejected_temperature(payload: dict, status_code: int, body: str) -> bool:
     """Remove ``temperature`` when the gateway explicitly rejects that field.
 
@@ -250,18 +315,22 @@ class LLMClient:
         self._quota_lock = threading.Lock()
         self._quota_failures: dict[str, str] = {}
         # Start with one request and discover available gateway capacity from
-        # successful responses. A fixed semaphore starts at full capacity and
-        # creates exactly the synchronized burst that tends to trigger 429s.
-        self._window = _AdaptiveConcurrencyWindow(
-            self.settings.max_concurrency)
+        # Per-model adaptive windows: the gateway rate-limits PER MODEL (probe-
+        # verified), so each model gets its own AIMD window and the scheduler runs
+        # the model group concurrently — aggregate throughput ≈ sum of windows.
+        self._windows = _PerModelWindows(self.settings.max_concurrency)
         self._usage_lock = threading.Lock()
         self.total_usage = LLMUsage()
 
+    def _active_window(self) -> "_AdaptiveConcurrencyWindow":
+        """The AIMD window for the model in force on THIS thread."""
+        return self._windows.window(self._active_model())
+
     def concurrency_stats(self) -> dict:
-        """Live scheduler snapshot (in-flight calls + adaptive window). Exposed so
-        the dashboard can show whether the AIMD controller has opened up to the
-        ceiling or backed off under gateway congestion."""
-        return self._window.stats()
+        """Live scheduler snapshot for the dashboard. Now fleet-wide: aggregate
+        in-flight across all per-model windows, plus a per-model breakdown, so the
+        gauge reflects the multi-model scheduler's real concurrency."""
+        return self._windows.aggregate_stats()
 
     def close(self) -> None:
         if self._owns_client:
@@ -313,24 +382,45 @@ class LLMClient:
         if not congested:
             time.sleep(delay)
             return
-        self._window.release(successful=False)
+        self._active_window().release(successful=False)
         try:
             time.sleep(delay)
         finally:
-            self._window.acquire()
+            self._active_window().acquire()
 
     def _with_model_fallback(self, chain: list[str], fn):
-        """Run `fn()` under each model in `chain`, advancing on quota exhaustion.
+        """Run `fn()` on a model from `chain`, spreading load across the group.
 
-        A model that returns a quota/429 error is skipped immediately (retrying
-        it can't help); the next model in the chain is tried. Any other failure
-        propagates as-is (fn already did its own transient retries). Raises
-        LLMQuotaError only if EVERY model in the chain is exhausted."""
+        The gateway rate-limits per model (probe-verified), so the models in
+        `chain` are treated as a concurrent scheduling GROUP, not a strict
+        priority order: each call picks the model with the most free capacity
+        right now (highest headroom = limit − in_flight), and runs under THAT
+        model's own AIMD window. Under concurrency this fans N simultaneous calls
+        across the group so their independent rate-limit buckets are summed.
+
+        Robustness preserved:
+        - A model that returns a quota error (429 code:2001) is marked exhausted
+          and dropped from the group; the remaining models take over.
+        - A rate-limited model's window shrinks (congestion feedback), lowering
+          its headroom, so the picker naturally shifts new work to freer models.
+        - Raises LLMQuotaError only if EVERY model in the group is exhausted.
+        """
         last_quota: LLMQuotaError | None = None
-        for model in self._available_models(chain):
+        # Try each available model at most once per call; order by current
+        # headroom so the freest model goes first. Re-evaluate after each failure
+        # since in-flight counts move under concurrency.
+        tried: set[str] = set()
+        while True:
+            candidates = [m for m in self._available_models(chain) if m not in tried]
+            if not candidates:
+                break
+            # Pick the model with the most free capacity right now (ties: chain order).
+            model = max(candidates, key=lambda m: self._windows.headroom(m))
+            tried.add(model)
             self._local.effective_model = model
+            window = self._windows.window(model)
             successful = False
-            self._window.acquire()
+            window.acquire()
             try:
                 res = fn()
                 successful = True
@@ -341,10 +431,10 @@ class LLMClient:
             except LLMQuotaError as exc:
                 last_quota = exc
                 self._mark_quota_exhausted(model, exc)
-                log.warning("model %s quota exhausted; advancing fallback chain", model)
+                log.warning("model %s quota exhausted; dropping from group", model)
                 continue
             finally:
-                self._window.release(successful=successful)
+                window.release(successful=successful)
                 self._local.effective_model = None
         raise last_quota or LLMError("no model available in fallback chain")
 
@@ -493,7 +583,7 @@ class LLMClient:
         for m in self._available_models(chain):
             self._local.effective_model = m
             successful = False
-            self._window.acquire()
+            self._active_window().acquire()
             try:
                 self.last_model = m
                 yield from self._stream_once(messages, temperature, max_tokens)
@@ -505,7 +595,7 @@ class LLMClient:
                 log.warning("model %s quota exhausted (stream); trying next", m)
                 continue
             finally:
-                self._window.release(successful=successful)
+                self._active_window().release(successful=successful)
                 self._local.effective_model = None
         raise last_quota or LLMError("no model available in fallback chain")
 
@@ -542,7 +632,7 @@ class LLMClient:
                         if resp.status_code == 429 and _is_quota_body(body):
                             raise LLMQuotaError(f"quota exhausted: {body}")
                         if resp.status_code == 429 or resp.status_code >= 500:
-                            self._window.congestion()
+                            self._active_window().congestion()
                         raise LLMError(f"gateway {resp.status_code}: {body}")
                     for line in resp.iter_lines():
                         if not line or not line.startswith("data:"):
@@ -566,7 +656,7 @@ class LLMClient:
                             yield {"type": "content", "text": c}
                     return
         except httpx.HTTPError as exc:
-            self._window.congestion()
+            self._active_window().congestion()
             raise LLMError(f"stream failed: {exc}") from exc
 
     # ---- Anthropic Messages API adapter (Claude-* models) ---------------
@@ -645,7 +735,7 @@ class LLMClient:
                 congested = isinstance(
                     exc, (_GatewayCongestionError, httpx.TransportError))
                 if congested:
-                    self._window.congestion()
+                    self._active_window().congestion()
                 wait = _retry_delay(attempt, resp.headers.get("Retry-After")
                                     if "resp" in locals() else None)
                 log.warning("anthropic call failed (attempt %d/%d): %s; retry in %ds",
@@ -675,7 +765,7 @@ class LLMClient:
                         if resp.status_code == 429 and _is_quota_body(body):
                             raise LLMQuotaError(f"quota exhausted: {body}")
                         if resp.status_code == 429 or resp.status_code >= 500:
-                            self._window.congestion()
+                            self._active_window().congestion()
                         raise LLMError(f"gateway {resp.status_code}: {body}")
                     for line in resp.iter_lines():
                         if not line or not line.startswith("data:"):
@@ -697,7 +787,7 @@ class LLMClient:
                                 yield {"type": "content", "text": delta["text"]}
                     return
         except httpx.HTTPError as exc:
-            self._window.congestion()
+            self._active_window().congestion()
             raise LLMError(f"stream failed: {exc}") from exc
 
     def _gemini_responses(self, *, system: str, user: str,
@@ -743,7 +833,7 @@ class LLMClient:
                 congested = isinstance(
                     exc, (_GatewayCongestionError, httpx.TransportError))
                 if congested:
-                    self._window.congestion()
+                    self._active_window().congestion()
                 wait = _retry_delay(attempt, resp.headers.get("Retry-After")
                                     if "resp" in locals() else None)
                 log.warning("gemini call failed (attempt %d/%d): %s; retry in %ds",
@@ -818,7 +908,7 @@ class LLMClient:
                 congested = isinstance(
                     exc, (_GatewayCongestionError, httpx.TransportError))
                 if congested:
-                    self._window.congestion()
+                    self._active_window().congestion()
                 wait = _retry_delay(attempt, resp.headers.get("Retry-After")
                                     if "resp" in locals() else None)
                 log.warning("LLM call failed (attempt %d/%d): %s; retrying in %ds",

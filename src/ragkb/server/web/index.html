@@ -84,6 +84,11 @@
   .tp-sched-bar { position:relative; flex:1; min-width:120px; height:7px; border-radius:5px; background:#e7ebef; overflow:hidden; }
   .tp-sched-bar .sched-fill { position:absolute; left:0; top:0; height:100%; background:var(--accent); border-radius:5px; transition:width .4s ease; }
   .tp-sched-bar .sched-limit { position:absolute; top:-1px; width:2px; height:9px; background:var(--ink); opacity:.55; border-radius:1px; }
+  .sched-models { flex-basis:100%; display:flex; flex-wrap:wrap; gap:6px; margin-top:4px; }
+  .sched-chip { font-size:10px; padding:2px 7px; border-radius:10px; background:#eef1f4; color:var(--muted); border:1px solid transparent; }
+  .sched-chip.busy { background:var(--accent-soft); color:var(--accent); border-color:#bcdcf1; }
+  .sched-chip b { color:var(--text); }
+  .sched-chip.busy b { color:var(--accent); }
   .metric { background:var(--surface); padding:8px 12px; }
   .metric span { display:block; color:var(--muted); font-size:11px; }
   .metric strong { display:block; margin-top:2px; font-size:19px; line-height:1.2; }
@@ -342,23 +347,28 @@ function renderTotalProgress() {
 function renderConcurrency() {
   const c = S.concurrency || {};
   if (c.in_flight == null && c.limit == null) return '';
-  const inFlight = c.in_flight || 0, limit = c.limit || 1, max = c.maximum || limit;
-  const win = c.window ?? limit, threshold = c.threshold;
-  // In-flight fill against the CURRENT window; a faint marker shows the hard max.
-  const fillPct = Math.min(100, inFlight / max * 100);
-  const limitPct = Math.min(100, limit / max * 100);
-  // Phase: below threshold the AIMD controller is in slow-start (doubling),
-  // at/above it's in congestion-avoidance (cautious additive growth).
-  const phase = (threshold != null && win < threshold) ? '慢启动' : '拥塞避让';
+  const inFlight = c.in_flight || 0, limit = c.limit || 1;
+  const perModel = c.per_model || {};
+  const activeModels = c.active_models ?? Object.keys(perModel).length;
+  // Aggregate fill: total in-flight against total allowed window across all
+  // per-model buckets. The whole point of the multi-model scheduler is that this
+  // sum can exceed any single model's cap.
+  const fillPct = limit > 0 ? Math.min(100, inFlight / limit * 100) : 0;
+  // Per-model mini-bars: one chip per active model showing its own in_flight/limit.
+  const shortName = m => m.replace(/-(Preview-)?joybuilder$/,'').replace(/^Claude-/,'').replace(/^Gemini-/,'G-');
+  const chips = Object.entries(perModel).map(([m, s]) => {
+    const inf = s.in_flight || 0, lim = s.limit || 1;
+    const busy = inf > 0;
+    return `<span class="sched-chip ${busy?'busy':''}" title="${esc(m)}：并发 ${inf}/${lim}，窗口 ${s.window}">${esc(shortName(m))} <b>${inf}</b>/${lim}</span>`;
+  }).join('');
   return `
     <div class="tp-sched">
       <span class="tp-sched-label">调度器并发</span>
-      <span class="tp-sched-num"><b>${inFlight}</b> 并发中 · 窗口 ${win}/${max}${c.limit!=null?` · 允许 ${limit}`:''}</span>
-      <span class="tp-sched-phase ${phase==='慢启动'?'is-slow':'is-avoid'}">${phase}</span>
+      <span class="tp-sched-num"><b>${inFlight}</b> 并发中 · 合计窗口 ${limit} · ${activeModels} 模型并行</span>
       <div class="tp-sched-bar">
         <i class="sched-fill" style="width:${fillPct}%"></i>
-        <i class="sched-limit" style="left:${limitPct}%"></i>
       </div>
+      ${chips?`<div class="sched-models">${chips}</div>`:''}
     </div>`;
 }
 function renderHeader() {

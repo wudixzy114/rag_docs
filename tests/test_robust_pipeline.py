@@ -369,16 +369,20 @@ def test_llm_client_uses_multiplicative_decrease_on_gateway_congestion(monkeypat
         JD_LLM_MAX_RETRIES=2)
     transport = _RateLimitedClient()
     client = LLMClient(settings=settings, client=transport)
+    # Rate limiting is now per-model: grab the window for the model under test and
+    # warm it up to the ceiling via successful acquire/release cycles.
+    window = client._windows.window("Test-OpenAI")
     for _ in range(7):
-        client._window.acquire()
-        client._window.release(successful=True)
-    assert client._window.limit == 8
+        window.acquire()
+        window.release(successful=True)
+    assert window.limit == 8
 
     monkeypatch.setattr("ragkb.llm.client.time.sleep", lambda _: None)
     result = client.complete(system="s", user="u", model="Test-OpenAI")
     assert result.text == "ok"
     assert transport.calls == 2
-    assert client._window.limit == 4
+    # A 429 congestion signal halves THAT model's window (multiplicative decrease).
+    assert client._windows.window("Test-OpenAI").limit == 4
 
 
 def test_public_state_strips_source_evidence_but_keeps_review_status():
