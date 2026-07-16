@@ -32,13 +32,30 @@ _MAX_EDGE = 2200
 
 
 def fit_image(data: bytes, media_type: str) -> tuple[bytes, str]:
-    """Return (bytes, media_type) guaranteed within the gateway size budget when
-    possible. Converts animated GIF to its first frame. Falls back to the original
-    bytes if Pillow is unavailable or processing fails (caller handles the read).
+    """Return (bytes, media_type) within the gateway's limits when possible.
+
+    The gateway rejects an image for EITHER reason: payload too large (>5 MB) OR
+    pixel dimensions too large (a long edge beyond the model's cap — an 8192px-wide
+    banner is only 0.2 MB yet still 400s). So the decision to preprocess must gate
+    on BOTH bytes and dimensions, not bytes alone. Also converts animated GIF to
+    its first frame. Falls back to the original bytes if Pillow is unavailable or
+    processing fails (caller records the read failure rather than crashing).
     """
     is_gif = media_type == "image/gif"
-    if len(data) <= _MAX_BYTES and not is_gif:
-        return data, media_type
+    small_bytes = len(data) <= _MAX_BYTES
+    # Cheap header-only dimension probe (PIL.open is lazy; it doesn't decode pixels
+    # until needed). If we can't read the size, fall through to the full path.
+    over_pixels = False
+    if small_bytes and not is_gif:
+        try:
+            from PIL import Image as PILImage
+            with PILImage.open(io.BytesIO(data)) as probe:
+                w, h = probe.size
+            over_pixels = max(w, h) > _MAX_EDGE
+        except Exception:  # noqa: BLE001 - can't size it → let full path try
+            over_pixels = False
+        if not over_pixels:
+            return data, media_type  # within both byte and pixel budgets
     try:
         from PIL import Image as PILImage
     except ImportError:
