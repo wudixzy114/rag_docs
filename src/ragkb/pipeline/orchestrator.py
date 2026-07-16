@@ -388,6 +388,10 @@ class Orchestrator:
                     if not res.error or res.topic not in self._results:
                         with self._lock:
                             self._results[res.topic] = res
+            # Persist the per-doc extraction snapshot BEFORE consolidation, so a
+            # crash/quota-exhaustion during the (long, network-heavy) review phase
+            # never discards work that already succeeded.
+            self._persist_results()
             self._consolidate()
             self._persist_results()
             usage = self.llm.total_usage
@@ -399,6 +403,15 @@ class Orchestrator:
             return dict(self._results)
         finally:
             sampler_stop.set()
+            # Best-effort final persist: whatever units are in memory (including any
+            # already-approved by a partial review before an exception) must reach
+            # results.json. Never let an exception on the happy path lose reviewed
+            # work — the user's hard rule: "跑完过的成品一定要保留". Guarded so a
+            # persist failure can't mask the original error.
+            try:
+                self._persist_results()
+            except Exception:  # noqa: BLE001 - observability/persist must not raise here
+                log.exception("final persist failed")
             # Emit a final zeroed snapshot so the dashboard doesn't leave a stale
             # in-flight count showing after the run ends.
             self.bus.publish("concurrency", in_flight=0,
@@ -421,21 +434,31 @@ class Orchestrator:
             self.bus.publish("stage", topic, stage=stage, status=status,
                              attempt=unit.review_attempts, detail=detail)
 
-        review_with_regeneration(
-            pending_review, self.llm,
-            max_attempts=self.settings.review_regeneration_attempts,
-            reviewer_model=self.settings.reviewer_model or None,
-            on_stage=_review_stage)
+        # Review QA then SOP. Each phase is guarded: an exception (or quota) in one
+        # must not discard the other's results, nor the redistribution/persist that
+        # commits already-approved units to disk. review_* already degrade under
+        # quota (keep + flag), so this catch is the backstop for anything unexpected.
+        try:
+            review_with_regeneration(
+                pending_review, self.llm,
+                max_attempts=self.settings.review_regeneration_attempts,
+                reviewer_model=self.settings.reviewer_model or None,
+                on_stage=_review_stage)
+        except Exception:  # noqa: BLE001 - never lose reviewed work to one phase failing
+            log.exception("QA review phase failed; keeping partial verdicts")
 
         all_sop = [u for res in self._results.values() for u in res.sop if u.struct_ok]
         pending_sop_review = [u for u in all_sop if u.semantic_ok is None]
         self.bus.publish(
             "log", message=f"reviewing {len(pending_sop_review)} changed SOP units")
-        review_sop_with_regeneration(
-            pending_sop_review, self.llm,
-            max_attempts=self.settings.review_regeneration_attempts,
-            reviewer_model=self.settings.reviewer_model or None,
-            on_stage=_review_stage)
+        try:
+            review_sop_with_regeneration(
+                pending_sop_review, self.llm,
+                max_attempts=self.settings.review_regeneration_attempts,
+                reviewer_model=self.settings.reviewer_model or None,
+                on_stage=_review_stage)
+        except Exception:  # noqa: BLE001
+            log.exception("SOP review phase failed; keeping partial verdicts")
 
         survivors = [u for u in aggregated if u.semantic_ok]
         failed_review = [u for u in aggregated if not u.semantic_ok]

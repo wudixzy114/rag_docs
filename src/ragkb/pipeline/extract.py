@@ -26,6 +26,10 @@ log = logging.getLogger(__name__)
 
 _EXTRACT_MAX_TOKENS = 4096
 _SOP_MAX_TOKENS = 6144
+# A dense SOP section (long body + many image transcripts) can overflow the base
+# budget and come back truncated → invalid JSON. Retry once at this larger budget
+# before failing, so a big section isn't lost the way V2.5.0「亮点功能」was.
+_SOP_RETRY_MAX_TOKENS = 12288
 _BATCH_MAX_ITEMS = 8
 _BATCH_MAX_CHARS = 18000
 
@@ -179,15 +183,32 @@ def extract_sop(doc: Document, sec: Section, llm: LLMClient,
             return SOPUnit(title=sec.title, markdown=hit.get("markdown", ""),
                            entry_questions=hit.get("entry_questions", []),
                            sources=[prov], truncated=False) if hit.get("markdown") else None
-    try:
-        r = llm.complete(system=SOP_SYSTEM, user=user,
-                         max_tokens=max_tokens, task="sop", model=model)
-    except LLMError as exc:
-        raise LLMError(f"extract_sop failed [{doc.topic} {sec.sid}]: {exc}") from exc
-    truncated = r.finish_reason == "length"
-    obj = parse_json_object(r.text)
+    # Try at the base budget; if the result is truncated or unparseable (a dense
+    # section overflowing the completion window), retry once with a bigger budget
+    # before giving up. This is the SOP analogue of the QA truncation retry.
+    budgets = [max_tokens]
+    if _SOP_RETRY_MAX_TOKENS > max_tokens:
+        budgets.append(_SOP_RETRY_MAX_TOKENS)
+    obj = None
+    truncated = False
+    last_reason = "no response"
+    for attempt, budget in enumerate(budgets):
+        try:
+            r = llm.complete(system=SOP_SYSTEM, user=user,
+                             max_tokens=budget, task="sop", model=model)
+        except LLMError as exc:
+            raise LLMError(f"extract_sop failed [{doc.topic} {sec.sid}]: {exc}") from exc
+        truncated = r.finish_reason == "length"
+        obj = parse_json_object(r.text)
+        if obj is not None and not truncated:
+            break  # clean parse, complete response
+        last_reason = "truncated" if truncated else "invalid JSON"
+        if attempt + 1 < len(budgets):
+            log.warning("extract_sop %s [%s %s] at %d tokens; retrying at %d",
+                        last_reason, doc.topic, sec.sid, budget, budgets[attempt + 1])
     if obj is None:
-        raise LLMError(f"extract_sop returned invalid JSON [{doc.topic} {sec.sid}]")
+        raise LLMError(
+            f"extract_sop returned invalid JSON after retry [{doc.topic} {sec.sid}]")
     md = str(obj.get("markdown", "")).strip()
     eqs = [str(q).strip() for q in obj.get("entry_questions", []) if str(q).strip()]
     if not md:

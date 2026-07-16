@@ -18,8 +18,10 @@ Design:
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
+from ragkb.config import get_settings
 from ragkb.llm.client import LLMClient, LLMError, LLMQuotaError
 from ragkb.pipeline.batching import pack_by_size
 from ragkb.pipeline.jsonutil import parse_json_array
@@ -36,6 +38,19 @@ log = logging.getLogger(__name__)
 _REVIEW_BATCH = 12
 _REVIEW_MAX_CHARS = 36000
 _REVIEW_MAX_TOKENS = 4096
+
+
+def _review_workers() -> int:
+    """Concurrency for review batches. Review used to run batches strictly
+    serially "to keep gateway pressure low" — but that throttled the whole review
+    phase to ONE in-flight request, the worst bottleneck in the run. The gateway
+    rate-limits PER MODEL (probe-verified) and the client now spreads calls across
+    an independent-window model group, so concurrent review batches fan across
+    models safely. Bounded by the same max_workers ceiling the doc pool uses."""
+    try:
+        return max(1, get_settings().max_workers)
+    except Exception:
+        return 4
 
 
 @dataclass
@@ -96,9 +111,11 @@ def review_qa(units: list[QAUnit], llm: LLMClient,
     we SKIP review, keep every struct-ok unit, and flag them needs_review so a
     human can check later. Losing the review pass must not lose the extraction.
 
-    Batches run SERIALLY (no internal thread pool): review already runs once after
-    the per-doc pool has closed, and serial batches keep gateway pressure low so
-    one shared quota isn't hammered by nested concurrency.
+    Batches run CONCURRENTLY (bounded by max_workers): the client fans them
+    across the independent per-model rate-limit windows, so review no longer
+    bottlenecks the run to a single in-flight request. A quota exhaustion on any
+    batch stops issuing NEW batches and keeps everything (reviewed + not), flagged
+    for human review — losing the review pass must not lose the extraction.
     """
     if not units:
         return units
@@ -109,35 +126,49 @@ def review_qa(units: list[QAUnit], llm: LLMClient,
         max_items=_REVIEW_BATCH, max_chars=_REVIEW_MAX_CHARS)
 
     verdicts: dict[int, _Verdict] = {}
-    for chunk_no, chunk in enumerate(chunks):
-        try:
-            batch_verdicts = _run_batch(chunk, llm, model=model)
-        except LLMQuotaError:
-            # Reviewer out of quota — stop reviewing entirely. Keep everything
-            # already-and-not-yet reviewed, flagged for human review.
-            log.warning("reviewer quota exhausted; skipping semantic review for "
-                        "remaining %d units (kept, flagged needs_review)",
-                        sum(len(c) for c in chunks[chunk_no:]))
-            _apply_known(units, verdicts)
-            _mark_skipped(units)
-            return units
-        except LLMError as exc:
-            log.warning("review batch failed (%d items): %s", len(chunk), exc)
-            batch_verdicts = {}
-        verdicts.update(batch_verdicts)
+    quota_hit = False
 
-        # One bounded repair call containing only omitted IDs. This makes the
-        # documented repair behavior real and avoids paying to re-review valid rows.
-        missing = [pair for pair in chunk if pair[0] not in batch_verdicts]
-        if missing:
+    def _run(chunk):
+        return _run_batch(chunk, llm, model=model)
+
+    # First pass: all batches concurrently.
+    with ThreadPoolExecutor(max_workers=_review_workers()) as pool:
+        futures = {pool.submit(_run, chunk): chunk for chunk in chunks}
+        for fut in as_completed(futures):
             try:
-                verdicts.update(_run_batch(missing, llm, model=model))
+                verdicts.update(fut.result())
             except LLMQuotaError:
-                _apply_known(units, verdicts)
-                _mark_skipped(units)
-                return units
+                quota_hit = True
             except LLMError as exc:
-                log.warning("review repair failed (%d items): %s", len(missing), exc)
+                log.warning("review batch failed (%d items): %s",
+                            len(futures[fut]), exc)
+
+    # Repair pass: one bounded retry for any ids the first pass omitted, also
+    # concurrent. Skipped entirely if quota already exhausted.
+    if not quota_hit:
+        missing_chunks = [[pair for pair in chunk if pair[0] not in verdicts]
+                          for chunk in chunks]
+        missing_chunks = [c for c in missing_chunks if c]
+        if missing_chunks:
+            with ThreadPoolExecutor(max_workers=_review_workers()) as pool:
+                futures = {pool.submit(_run, c): c for c in missing_chunks}
+                for fut in as_completed(futures):
+                    try:
+                        verdicts.update(fut.result())
+                    except LLMQuotaError:
+                        quota_hit = True
+                    except LLMError as exc:
+                        log.warning("review repair failed (%d items): %s",
+                                    len(futures[fut]), exc)
+
+    if quota_hit:
+        # Reviewer out of quota mid-phase: apply what we DID review, keep the rest
+        # flagged for human review rather than hard-failing unreviewed work.
+        log.warning("reviewer quota exhausted; kept %d verdicts, flagging the rest "
+                    "needs_review", len(verdicts))
+        _apply_known(units, verdicts)
+        _mark_skipped(units)
+        return units
 
     for i, u in indexed:
         if i not in verdicts:
@@ -249,7 +280,8 @@ def review_sop(units: list[SOPUnit], llm: LLMClient,
 
     Missing/invalid verdicts and reviewer errors cannot approve an SOP. A quota
     failure preserves the candidate in results.json for manual recovery but marks
-    it failed_review so neither export path can publish it.
+    it failed_review so neither export path can publish it. Batches run
+    CONCURRENTLY (bounded by max_workers) across the per-model windows.
     """
     if not units:
         return units
@@ -261,30 +293,44 @@ def review_sop(units: list[SOPUnit], llm: LLMClient,
         max_items=_SOP_REVIEW_BATCH, max_chars=_SOP_REVIEW_MAX_CHARS)
 
     verdicts: dict[int, _SOPVerdict] = {}
-    for chunk_no, chunk in enumerate(chunks):
-        try:
-            batch_verdicts = _run_sop_batch(chunk, llm, model=model)
-        except LLMQuotaError:
-            log.warning("reviewer quota exhausted; skipping SOP semantic review for "
-                        "remaining %d units", sum(len(c) for c in chunks[chunk_no:]))
-            _apply_known_sop(units, verdicts)
-            _mark_skipped_sop(units)
-            return units
-        except LLMError as exc:
-            log.warning("SOP review batch failed (%d items): %s", len(chunk), exc)
-            batch_verdicts = {}
-        verdicts.update(batch_verdicts)
+    quota_hit = False
 
-        missing = [pair for pair in chunk if pair[0] not in batch_verdicts]
-        if missing:
+    def _run(chunk):
+        return _run_sop_batch(chunk, llm, model=model)
+
+    with ThreadPoolExecutor(max_workers=_review_workers()) as pool:
+        futures = {pool.submit(_run, chunk): chunk for chunk in chunks}
+        for fut in as_completed(futures):
             try:
-                verdicts.update(_run_sop_batch(missing, llm, model=model))
+                verdicts.update(fut.result())
             except LLMQuotaError:
-                _apply_known_sop(units, verdicts)
-                _mark_skipped_sop(units)
-                return units
+                quota_hit = True
             except LLMError as exc:
-                log.warning("SOP review repair failed (%d items): %s", len(missing), exc)
+                log.warning("SOP review batch failed (%d items): %s",
+                            len(futures[fut]), exc)
+
+    if not quota_hit:
+        missing_chunks = [[pair for pair in chunk if pair[0] not in verdicts]
+                          for chunk in chunks]
+        missing_chunks = [c for c in missing_chunks if c]
+        if missing_chunks:
+            with ThreadPoolExecutor(max_workers=_review_workers()) as pool:
+                futures = {pool.submit(_run, c): c for c in missing_chunks}
+                for fut in as_completed(futures):
+                    try:
+                        verdicts.update(fut.result())
+                    except LLMQuotaError:
+                        quota_hit = True
+                    except LLMError as exc:
+                        log.warning("SOP review repair failed (%d items): %s",
+                                    len(futures[fut]), exc)
+
+    if quota_hit:
+        log.warning("reviewer quota exhausted (SOP); kept %d verdicts, flagging "
+                    "the rest needs_review", len(verdicts))
+        _apply_known_sop(units, verdicts)
+        _mark_skipped_sop(units)
+        return units
 
     for i, unit in indexed:
         result = verdicts.get(i)

@@ -18,6 +18,7 @@ import logging
 from ragkb.llm.client import LLMClient, LLMError, LLMQuotaError, VisionImage
 from ragkb.parse.model import Image
 from ragkb.pipeline.prompts import VISION_VERSION, VISION_SYSTEM, build_vision_user
+from ragkb.pipeline.imageprep import fit_image
 from ragkb.pipeline.scrub import mask
 from ragkb.store.cache import Cache, key_for
 
@@ -64,7 +65,11 @@ def vision_read_image(img: Image, llm: LLMClient, cache: Cache,
         img.vision_text = cached.get("transcript", "")
         return cached
 
-    vi = VisionImage(data=img.data_bytes(), media_type=img.media_type())
+    # Fit the image under the gateway's size cap before sending: shrink oversize
+    # rasters, take the first frame of an animated GIF. Keyed cache above is on the
+    # ORIGINAL bytes, so this reprocessing happens once per uncached image.
+    fitted_data, fitted_media = fit_image(img.data_bytes(), img.media_type())
+    vi = VisionImage(data=fitted_data, media_type=fitted_media)
     budgets = [max_tokens]
     if retry_max_tokens is not None and retry_max_tokens > max_tokens:
         budgets.append(retry_max_tokens)
