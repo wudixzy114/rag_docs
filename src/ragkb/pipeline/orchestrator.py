@@ -80,7 +80,10 @@ class Orchestrator:
                  bus: EventBus | None = None,
                  llm: LLMClient | None = None) -> None:
         self.settings = settings or get_settings()
-        self.bus = bus or EventBus()
+        # Default bus journals to output/events.jsonl so a CLI run and the
+        # dashboard server (separate processes) share one cross-process event
+        # stream. A caller that passes its own bus opts into its own policy.
+        self.bus = bus or EventBus(journal_path=self.settings.output_dir / "events.jsonl")
         self.llm = llm or LLMClient()
         self.cache = Cache(self.settings.cache_dir)
         self.manifest = Manifest(self.settings.output_dir / "manifest.json")
@@ -170,6 +173,12 @@ class Orchestrator:
                 gate_sop(u)
             qa = self._retry_truncated_qa(doc, secs, labels, qa)
             sop = self._retry_truncated_sop(doc, secs, sop)
+            # A section classified 'qa' that yields no structurally valid QA is
+            # almost always announcement/说明 content mislabeled by the classifier
+            # (release notes, concept intros). Rather than fail the whole doc on the
+            # coverage invariant, retry it as SOP. Emits a visible 'fallback' event
+            # per section so the reclassification is never silent.
+            qa, sop = self._fallback_qa_to_sop(doc, secs, labels, qa, sop)
             self._assert_extraction_coverage(secs, labels, qa, sop)
             self.bus.publish("stage", topic, stage="validate", status="done",
                              detail=(f"{sum(u.struct_ok for u in qa)} QA / "
@@ -230,6 +239,54 @@ class Orchestrator:
             self.bus.publish("log", doc.topic,
                              message=f"retried truncated SOP section {sid}")
         return good
+
+    def _fallback_qa_to_sop(self, doc, secs, labels, qa, sop):
+        """Retry 'qa' sections that produced no valid QA as SOP extraction.
+
+        The classifier occasionally labels announcement/说明 content (release
+        notes, concept pages) as 'qa'; the extractor then honestly returns [],
+        which would trip the coverage invariant and fail the whole document. This
+        catches those sections, re-extracts each as an SOP, and — on success —
+        moves it into the SOP set and rewrites its label so coverage passes.
+
+        Every reclassification publishes a 'fallback' event (topic + section +
+        title + outcome) so the operator sees exactly what was reclassified and
+        why — never a silent behavior change.
+        """
+        qa_ok_sids = {p.section_sid for u in qa if u.struct_ok for p in u.sources}
+        by_sid = {s.sid: s for s in secs}
+        gap_sids = [s.sid for s in secs
+                    if labels.get(s.sid, "qa") == "qa" and s.sid not in qa_ok_sids]
+        if not gap_sids:
+            return qa, sop
+        for sid in gap_sids:
+            section = by_sid.get(sid)
+            if section is None:
+                continue
+            self.bus.publish(
+                "fallback", doc.topic, section=sid, title=section.title,
+                heading_path=section.full_title, status="running",
+                message=f"section {sid}「{section.title}」判为 QA 但抽取为空，回退尝试作为 SOP")
+            unit = extract_sop(doc, section, self.llm, cache=self.cache)
+            if unit:
+                gate_sop(unit)
+            if unit and unit.struct_ok:
+                sop.append(unit)
+                labels[sid] = "sop"      # so coverage checks the SOP set for this sid
+                # Drop any empty/invalid QA shells for this section to keep results clean.
+                qa = [u for u in qa if not any(p.section_sid == sid for p in u.sources)
+                      or u.struct_ok]
+                self.bus.publish(
+                    "fallback", doc.topic, section=sid, title=section.title,
+                    heading_path=section.full_title, status="done",
+                    message=f"section {sid}「{section.title}」已回退为 SOP：{unit.title}")
+            else:
+                reason = unit.struct_reason if unit else "extract_sop 返回空"
+                self.bus.publish(
+                    "fallback", doc.topic, section=sid, title=section.title,
+                    heading_path=section.full_title, status="failed",
+                    message=f"section {sid}「{section.title}」回退 SOP 仍失败：{reason}")
+        return qa, sop
 
     @staticmethod
     def _assert_extraction_coverage(secs, labels, qa, sop) -> None:
@@ -304,6 +361,24 @@ class Orchestrator:
                 continue
             todo.append(p)
 
+        # Sample the LLM scheduler's live concurrency and publish it to the event
+        # journal ~1/s so the dashboard can show, cross-process, how many calls are
+        # in flight vs. the adaptive window's current limit. Covers the whole run
+        # (doc pool AND the review/consolidation phase, both of which hit the gateway).
+        sampler_stop = threading.Event()
+
+        def _sample_concurrency():
+            while not sampler_stop.is_set():
+                try:
+                    snap = self.llm.concurrency_stats()
+                    self.bus.publish("concurrency", **snap)
+                except Exception:      # observability must never break a run
+                    pass
+                sampler_stop.wait(1.0)
+
+        sampler = threading.Thread(target=_sample_concurrency, daemon=True)
+        sampler.start()
+
         try:
             with ThreadPoolExecutor(max_workers=self.settings.max_workers) as pool:
                 futures = {pool.submit(self._process_doc, p, topics[p]): p for p in todo}
@@ -323,6 +398,12 @@ class Orchestrator:
                 total_tokens=usage.total_tokens - before[2])
             return dict(self._results)
         finally:
+            sampler_stop.set()
+            # Emit a final zeroed snapshot so the dashboard doesn't leave a stale
+            # in-flight count showing after the run ends.
+            self.bus.publish("concurrency", in_flight=0,
+                             **{k: v for k, v in self.llm.concurrency_stats().items()
+                                if k != "in_flight"})
             self._running = False
 
     def _consolidate(self) -> None:

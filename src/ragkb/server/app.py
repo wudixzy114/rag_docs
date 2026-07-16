@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
 import threading
 from pathlib import Path
 
@@ -25,7 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from ragkb.config import get_settings
-from ragkb.pipeline.events import EventBus
+from ragkb.pipeline.events import EventBus, read_journal
 from ragkb.pipeline.orchestrator import Orchestrator
 
 _WEB_DIR = Path(__file__).parent / "web"
@@ -35,7 +34,11 @@ log = logging.getLogger(__name__)
 def create_app() -> FastAPI:
     app = FastAPI(title="诊断知识库流水线")
     settings = get_settings()
-    bus = EventBus()
+    # Journal-backed bus: the dashboard reads live state from the on-disk journal,
+    # so it reflects runs started HERE (via /api/run) AND runs started from the
+    # CLI in a separate process. The journal is the cross-process source of truth.
+    journal_path = settings.output_dir / "events.jsonl"
+    bus = EventBus(journal_path=journal_path)
     orch = Orchestrator(settings=settings, bus=bus)
     run_lock = threading.Lock()
     state = {"running": False}
@@ -74,24 +77,44 @@ def create_app() -> FastAPI:
                 results = _public_results(json.loads(results_path.read_text("utf-8")))
             except (json.JSONDecodeError, ValueError):
                 results = {}
-        history = bus.history()
+        # Read events from the on-disk journal (cross-process): reflects runs from
+        # the CLI as well as this server. Fall back to in-memory history if the
+        # journal isn't present yet.
+        journal_events, _ = read_journal(journal_path, 0)
+        if journal_events:
+            recent = journal_events[-2000:]
+        else:
+            recent = [event.to_dict() for event in bus.history()]
         stages: dict[str, dict[str, dict]] = {}
         errors = []
         last_run = {}
-        for event in history:
-            if event.kind == "stage" and event.topic:
-                stages.setdefault(event.topic, {})[event.data.get("stage", "unknown")] = {
-                    **event.data, "seq": event.seq, "ts": event.ts}
-            elif event.kind == "error":
-                errors.append(event.to_dict())
-            elif event.kind == "run_status":
-                last_run = {**event.data, "seq": event.seq, "ts": event.ts}
+        concurrency = {}
+        for event in recent:
+            kind = event.get("kind")
+            topic = event.get("topic", "")
+            data = event.get("data", {}) or {}
+            if kind == "stage" and topic:
+                stages.setdefault(topic, {})[data.get("stage", "unknown")] = {
+                    **data, "seq": event.get("seq"), "ts": event.get("ts")}
+            elif kind == "error":
+                errors.append(event)
+            elif kind == "run_status":
+                last_run = {**data, "seq": event.get("seq"), "ts": event.get("ts")}
+            elif kind == "concurrency":
+                concurrency = {**data, "ts": event.get("ts")}
         llm_settings = orch.llm.settings
         usage = orch.llm.total_usage
+        # `running` reflects a run in ANY process: this server's own flag, or a
+        # journal whose latest run_status is 'started' (e.g. a CLI run).
+        running = state["running"] or last_run.get("status") == "started"
+        # Keep the high-frequency concurrency heartbeat out of the visible event
+        # feed; it's surfaced as a live gauge via `concurrency` instead.
+        feed = [e for e in recent if e.get("kind") != "concurrency"]
         return JSONResponse({
-            "docs": docs, "results": results, "running": state["running"],
+            "docs": docs, "results": results, "running": running,
             "stages": stages, "errors": errors[-50:], "last_run": last_run,
-            "events": [event.to_dict() for event in history[-300:]],
+            "concurrency": concurrency,
+            "events": feed[-300:],
             "usage": usage.__dict__,
             "models": {
                 "classify": llm_settings.model_for("classify"),
@@ -102,24 +125,37 @@ def create_app() -> FastAPI:
 
     @app.get("/api/events")
     async def api_events(request: Request):
-        q = bus.subscribe()
-        # Replay recent history so a late browser catches up.
-        backlog = [ev.to_dict() for ev in bus.history()[-300:]]
+        # Tail the on-disk journal by byte offset rather than only this process's
+        # in-memory queue: that's what lets the dashboard stream events produced
+        # by ANOTHER process (a CLI `ragkb run`). Start near the end so a fresh
+        # connection replays a bounded backlog, then follows appends live.
+        import asyncio
+
+        all_events, offset = read_journal(journal_path, 0)
+        backlog = all_events[-300:]
 
         async def gen():
+            nonlocal offset
             try:
                 for ev in backlog:
                     yield {"data": json.dumps(ev, ensure_ascii=False)}
+                idle = 0
                 while True:
                     if await request.is_disconnected():
                         break
-                    try:
-                        ev = q.get(timeout=1.0)
-                        yield {"data": json.dumps(ev.to_dict(), ensure_ascii=False)}
-                    except queue.Empty:
-                        yield {"event": "ping", "data": "{}"}
-            finally:
-                bus.unsubscribe(q)
+                    new_events, offset = read_journal(journal_path, offset)
+                    if new_events:
+                        idle = 0
+                        for ev in new_events:
+                            yield {"data": json.dumps(ev, ensure_ascii=False)}
+                    else:
+                        idle += 1
+                        if idle >= 5:      # ~a ping every 5 idle polls (5s)
+                            idle = 0
+                            yield {"event": "ping", "data": "{}"}
+                    await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                raise
 
         return EventSourceResponse(gen())
 

@@ -60,6 +60,30 @@
   .mini-progress { height:3px; background:#e7ebef; margin:8px 0 0 16px; }
   .mini-progress i { display:block; height:100%; background:var(--accent); }
   .summary-band { min-height:72px; padding:10px 18px; display:grid; grid-template-columns:repeat(5,minmax(90px,1fr)); gap:1px; background:var(--line); border-bottom:1px solid var(--line); }
+  .total-progress { padding:14px 18px 4px; border-bottom:1px solid #edf0f3; }
+  .tp-head { display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:7px; }
+  .tp-title { font-size:12px; color:var(--muted); font-weight:600; }
+  .tp-title b { color:var(--text); }
+  .tp-pct { font-size:20px; font-weight:700; line-height:1; color:var(--ink); }
+  .tp-pct span { font-size:12px; font-weight:500; color:var(--muted); margin-left:2px; }
+  .tp-bar { height:9px; border-radius:6px; background:#e7ebef; overflow:hidden; display:flex; }
+  .tp-bar i { height:100%; display:block; transition:width .45s ease; }
+  .tp-bar .seg-done { background:var(--ok); }
+  .tp-bar .seg-running { background:var(--accent); }
+  .tp-bar .seg-failed { background:var(--error); }
+  .tp-legend { margin-top:7px; display:flex; flex-wrap:wrap; gap:12px; color:var(--muted); font-size:11px; }
+  .tp-legend span { display:inline-flex; align-items:center; gap:5px; }
+  .tp-legend i { width:8px; height:8px; border-radius:2px; flex:none; }
+  .tp-sched { margin-top:9px; padding-top:9px; border-top:1px dashed #e0e5ea; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .tp-sched-label { font-size:11px; color:var(--muted); font-weight:600; }
+  .tp-sched-num { font-size:11px; color:var(--text); }
+  .tp-sched-num b { font-size:14px; color:var(--accent); }
+  .tp-sched-phase { font-size:10px; padding:1px 7px; border-radius:10px; }
+  .tp-sched-phase.is-slow { background:var(--accent-soft); color:var(--accent); }
+  .tp-sched-phase.is-avoid { background:var(--warn-soft); color:var(--warn); }
+  .tp-sched-bar { position:relative; flex:1; min-width:120px; height:7px; border-radius:5px; background:#e7ebef; overflow:hidden; }
+  .tp-sched-bar .sched-fill { position:absolute; left:0; top:0; height:100%; background:var(--accent); border-radius:5px; transition:width .4s ease; }
+  .tp-sched-bar .sched-limit { position:absolute; top:-1px; width:2px; height:9px; background:var(--ink); opacity:.55; border-radius:1px; }
   .metric { background:var(--surface); padding:8px 12px; }
   .metric span { display:block; color:var(--muted); font-size:11px; }
   .metric strong { display:block; margin-top:2px; font-size:19px; line-height:1.2; }
@@ -102,6 +126,8 @@
   .event.error .event-kind, .event.failed .event-kind { background:var(--error); }
   .event.done .event-kind { background:var(--ok); }
   .event.running .event-kind { background:var(--accent); }
+  .event.fallback .event-kind { background:var(--warn); }
+  .event.fallback { background:var(--warn-soft); }
   .event-topic { flex:1; font-size:12px; font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .event-time { color:var(--quiet); font-size:10px; }
   .event-message { margin:3px 0 0 15px; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
@@ -148,6 +174,7 @@
   </aside>
 
   <main class="main">
+    <section class="total-progress" id="totalProgress"></section>
     <section class="summary-band" id="metrics"></section>
     <div class="error-banner" id="errorBanner"></div>
     <section class="detail-head">
@@ -180,7 +207,7 @@ const STAGES = [
   ['validate','校验'], ['regenerate','重生成'], ['review','审核']
 ];
 const STATUS_TEXT = {pending:'待处理',running:'运行中',done:'完成',failed:'失败',pinned:'已固定',skipped:'已跳过'};
-const S = {docs:{}, units:{}, stages:{}, events:[], errors:[], models:{}, usage:{}, lastRun:{}, selected:null, tab:'qa', running:false, seq:0};
+const S = {docs:{}, units:{}, stages:{}, events:[], errors:[], models:{}, usage:{}, lastRun:{}, concurrency:{}, selected:null, tab:'qa', running:false, seq:0};
 const $ = selector => document.querySelector(selector);
 
 function esc(value) {
@@ -214,6 +241,7 @@ function hydrate(data) {
   S.models = data.models || {};
   S.usage = data.usage || {};
   S.lastRun = data.last_run || {};
+  S.concurrency = data.concurrency || {};
   const nextUnits = {};
   for (const unit of data.results?.qa || []) {
     const topic = topicOf(unit); (nextUnits[topic] ||= []).push({...unit,unit_kind:'qa'});
@@ -244,6 +272,13 @@ function setConnection(kind, text) {
 function onEvent(event) {
   if (!event || (event.seq && event.seq <= S.seq)) return;
   S.seq = Math.max(S.seq, event.seq || 0);
+  // Concurrency is a high-frequency live gauge, not a log line: update state and
+  // repaint, but never let it into the scrolling event feed.
+  if (event.kind === 'concurrency') {
+    S.concurrency = {...event.data, ts: event.ts};
+    renderTotalProgress();
+    return;
+  }
   S.events.push(event); if (S.events.length > 300) S.events.shift();
   const data = event.data || {}, topic = event.topic;
   if (event.kind === 'doc_status') {
@@ -264,7 +299,67 @@ function onEvent(event) {
 }
 
 function render() {
-  renderHeader(); renderMetrics(); renderDocs(); renderDetail(); renderEvents();
+  renderTotalProgress(); renderHeader(); renderMetrics(); renderDocs(); renderDetail(); renderEvents();
+}
+function renderTotalProgress() {
+  const docs = Object.values(S.docs), total = docs.length;
+  const node = $('#totalProgress');
+  if (!total) { node.innerHTML = ''; return; }
+  // Each doc contributes an equal 1/total slice. done/pinned/skipped = full;
+  // running = its per-stage progress fraction; failed counts as resolved (not
+  // stuck) but is surfaced separately in red; pending = 0.
+  const DONE = new Set(['done','pinned','skipped']);
+  let doneUnits = 0, runningUnits = 0, failedCount = 0, doneCount = 0, runningCount = 0, pendingCount = 0;
+  for (const doc of docs) {
+    const status = doc.status || 'pending';
+    if (DONE.has(status)) { doneUnits += 1; doneCount += 1; }
+    else if (status === 'failed') { failedCount += 1; }
+    else if (status === 'running') { runningUnits += docProgress(doc.topic) / 100; runningCount += 1; }
+    else { pendingCount += 1; }
+  }
+  const donePct = doneUnits / total * 100;
+  const runningPct = runningUnits / total * 100;
+  const failedPct = failedCount / total * 100;
+  const overall = Math.round(donePct + runningPct + failedPct);
+  node.innerHTML = `
+    <div class="tp-head">
+      <span class="tp-title">总进度 · <b>${doneCount}</b>/${total} 篇完成${runningCount?` · ${runningCount} 运行中`:''}${failedCount?` · ${failedCount} 失败`:''}</span>
+      <span class="tp-pct">${overall}<span>%</span></span>
+    </div>
+    <div class="tp-bar">
+      <i class="seg-done" style="width:${donePct}%"></i>
+      <i class="seg-running" style="width:${runningPct}%"></i>
+      <i class="seg-failed" style="width:${failedPct}%"></i>
+    </div>
+    <div class="tp-legend">
+      <span><i style="background:var(--ok)"></i>完成 ${doneCount}</span>
+      <span><i style="background:var(--accent)"></i>运行中 ${runningCount}</span>
+      <span><i style="background:var(--error)"></i>失败 ${failedCount}</span>
+      <span><i style="background:#e7ebef"></i>待处理 ${pendingCount}</span>
+    </div>
+    ${renderConcurrency()}`;
+}
+function renderConcurrency() {
+  const c = S.concurrency || {};
+  if (c.in_flight == null && c.limit == null) return '';
+  const inFlight = c.in_flight || 0, limit = c.limit || 1, max = c.maximum || limit;
+  const win = c.window ?? limit, threshold = c.threshold;
+  // In-flight fill against the CURRENT window; a faint marker shows the hard max.
+  const fillPct = Math.min(100, inFlight / max * 100);
+  const limitPct = Math.min(100, limit / max * 100);
+  // Phase: below threshold the AIMD controller is in slow-start (doubling),
+  // at/above it's in congestion-avoidance (cautious additive growth).
+  const phase = (threshold != null && win < threshold) ? '慢启动' : '拥塞避让';
+  return `
+    <div class="tp-sched">
+      <span class="tp-sched-label">调度器并发</span>
+      <span class="tp-sched-num"><b>${inFlight}</b> 并发中 · 窗口 ${win}/${max}${c.limit!=null?` · 允许 ${limit}`:''}</span>
+      <span class="tp-sched-phase ${phase==='慢启动'?'is-slow':'is-avoid'}">${phase}</span>
+      <div class="tp-sched-bar">
+        <i class="sched-fill" style="width:${fillPct}%"></i>
+        <i class="sched-limit" style="left:${limitPct}%"></i>
+      </div>
+    </div>`;
 }
 function renderHeader() {
   $('#runBtn').disabled = S.running; $('#exportBtn').disabled = S.running;
@@ -348,6 +443,11 @@ function renderEvents() {
   const events=S.events.slice(-120).reverse(); $('#eventCount').textContent=`${events.length} 条`;
   $('#eventList').innerHTML=events.length ? events.map(event => {
     const data=event.data||{}, status=data.status||event.kind;
+    if (event.kind==='fallback') {
+      // qa→sop reclassification — always visible, its own accent + full message.
+      const mark = status==='done' ? '✓' : status==='failed' ? '✗' : '↻';
+      return `<div class="event fallback"><div class="event-top"><i class="event-kind"></i><span class="event-topic">回退 ${mark} · ${esc(event.topic||'')}</span><span class="event-time">${fmtTime(event.ts)}</span></div><div class="event-message">${esc(data.message||'')}</div></div>`;
+    }
     const title=event.kind==='stage' ? `${data.stage || 'stage'} · ${status}` : event.kind;
     const message=data.detail||data.message||(event.kind==='run_status'?`calls ${data.calls||0} · tokens ${fmtNum(data.total_tokens)}`:'');
     return `<div class="event ${esc(status)}"><div class="event-top"><i class="event-kind"></i><span class="event-topic">${esc(event.topic||title)}</span><span class="event-time">${fmtTime(event.ts)}</span></div><div class="event-message">${esc(event.topic?title+(message?' · '+message:''):message||title)}</div></div>`;

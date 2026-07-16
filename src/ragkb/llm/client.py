@@ -98,6 +98,19 @@ class _AdaptiveConcurrencyWindow:
         with self._condition:
             return max(1, min(self.maximum, int(self._window)))
 
+    def stats(self) -> dict:
+        """Point-in-time scheduler snapshot for observability: how many calls are
+        in flight vs. the window the AIMD controller currently allows. Cheap and
+        lock-guarded so the dashboard can poll it without perturbing scheduling."""
+        with self._condition:
+            return {
+                "in_flight": self._in_flight,
+                "window": round(self._window, 2),
+                "limit": max(1, min(self.maximum, int(self._window))),
+                "maximum": self.maximum,
+                "threshold": round(self._slow_start_threshold, 2),
+            }
+
     def acquire(self) -> None:
         with self._condition:
             while self._in_flight >= max(1, int(self._window)):
@@ -243,6 +256,12 @@ class LLMClient:
             self.settings.max_concurrency)
         self._usage_lock = threading.Lock()
         self.total_usage = LLMUsage()
+
+    def concurrency_stats(self) -> dict:
+        """Live scheduler snapshot (in-flight calls + adaptive window). Exposed so
+        the dashboard can show whether the AIMD controller has opened up to the
+        ceiling or backed off under gateway congestion."""
+        return self._window.stats()
 
     def close(self) -> None:
         if self._owns_client:

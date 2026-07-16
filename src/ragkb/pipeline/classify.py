@@ -26,6 +26,14 @@ _QA_CUES = re.compile(r"(如何|怎么|怎样|为什么|为何|是什么|报错|
 _SOP_CUES = re.compile(r"(流程|步骤|规则|说明|板斧|规范|介绍|概述|原理|机制|准备|"
                        r"配置方法|操作步骤)")
 _SKIP_CUES = re.compile(r"^(目录|附录|提问之前|概览|index|toc|-+|=+)\s*$", re.I)
+# Release-note / product-dynamics headings: a date (2023.11.15 / 2024年11月) or a
+# version tag (V2.5.0). These sections announce "what shipped", never a Q&A — the
+# extractor correctly returns [] for them, which used to trip the coverage gate.
+# Route them to sop deterministically so they become 说明 docs, no LLM call needed.
+_RELEASE_TITLE_CUES = re.compile(
+    r"(^\s*v?\d+\.\d+(\.\d+)*"                    # V2.5.0 / 1.2.2
+    r"|\d{4}[.\-/年]\s*\d{1,2}"                    # 2023.11.15 / 2024年11月
+    r"|版本|发版|发布|更新日志|产品动态|上线)", re.I)
 
 
 def _prefilter(title: str, body: str) -> str | None:
@@ -44,6 +52,12 @@ def _prefilter(title: str, body: str) -> str | None:
     if qa and not sop:
         return "qa"
     if sop and not qa:
+        return "sop"
+    # A release-note / version / date heading with no QA signal is announcement
+    # content → sop. Matched against the RAW title `t`, not `t_clean`: the leading-
+    # number strip that builds t_clean eats a bare date ("2023.11.15" → "") and a
+    # version tag, so the cue would never fire on t_clean.
+    if not qa and _RELEASE_TITLE_CUES.search(t):
         return "sop"
     return None       # ambiguous or no cue → let the LLM decide
 

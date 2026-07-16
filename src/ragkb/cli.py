@@ -26,7 +26,9 @@ def run(only: list[str] = typer.Option(None, "--only", help="只处理指定主�
         export: bool = typer.Option(True, "--export/--no-export", help="完成后导出")):
     """Process documents and (by default) export the artifacts."""
     settings = get_settings()
-    bus = EventBus()
+    # Journal to output/events.jsonl so the dashboard (a separate process) can
+    # tail this CLI run's progress live.
+    bus = EventBus(journal_path=settings.output_dir / "events.jsonl")
     orch = Orchestrator(settings=settings, bus=bus)
 
     stop = threading.Event()
@@ -92,6 +94,12 @@ def _print_event(ev):
         typer.echo(f"=== run {ev.data.get('status','')} ===")
     elif k == "log":
         typer.echo(f"  · {ev.data.get('message','')}")
+    elif k == "fallback":
+        # qa→sop reclassification: make it loud (never silent, per user).
+        st = ev.data.get("status", "")
+        mark = {"done": "↳✓", "failed": "↳✗"}.get(st, "↳")
+        typer.secho(f"  {mark} [FALLBACK] {ev.data.get('message','')}",
+                    fg="yellow" if st != "failed" else "red")
     elif k == "error":
         typer.secho(f"  ✗ {ev.topic}: {ev.data.get('message','')}", fg="red")
 

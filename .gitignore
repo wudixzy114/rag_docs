@@ -16,11 +16,15 @@ venv/
 .env
 .env.*
 
-# --- 运行时输入与产物 (不入库) ---
-input/
-output/
-_test_run/
-知识库配对素材.zip
+# --- 本地语料、运行产物与归档 (不入库) ---
+# 仅匹配仓库根目录，避免误伤 tests/fixtures 等测试数据。
+/input*/
+/output*/
+/*_archive/
+/_test_run/
+/*.zip
+/*.log
+/待办与问题记录.md
 
 # --- 操作系统 ---
 .DS_Store
