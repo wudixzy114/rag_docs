@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from ragkb.llm.client import LLMClient, LLMError
+from ragkb.llm.client import LLMClient, LLMError, LLMOutputError
 from ragkb.parse.model import Document, Section
 from ragkb.pipeline.jsonutil import parse_json_array, parse_json_object
 from ragkb.pipeline.prompts import (
@@ -86,7 +86,8 @@ def extract_qa(doc: Document, sec: Section, llm: LLMClient,
     truncated = r.finish_reason == "length"
     arr = parse_json_array(r.text)
     if arr is None:
-        raise LLMError(f"extract_qa returned invalid JSON [{doc.topic} {sec.sid}]")
+        raise LLMOutputError(
+            f"extract_qa returned invalid JSON [{doc.topic} {sec.sid}]", r.text)
     units: list[QAUnit] = []
     raw: list[dict] = []
     for el in arr:
@@ -207,8 +208,9 @@ def extract_sop(doc: Document, sec: Section, llm: LLMClient,
             log.warning("extract_sop %s [%s %s] at %d tokens; retrying at %d",
                         last_reason, doc.topic, sec.sid, budget, budgets[attempt + 1])
     if obj is None:
-        raise LLMError(
-            f"extract_sop returned invalid JSON after retry [{doc.topic} {sec.sid}]")
+        raise LLMOutputError(
+            f"extract_sop returned invalid JSON after retry [{doc.topic} {sec.sid}]",
+            r.text)
     md = str(obj.get("markdown", "")).strip()
     eqs = [str(q).strip() for q in obj.get("entry_questions", []) if str(q).strip()]
     if not md:

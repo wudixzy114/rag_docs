@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from ragkb.pipeline.scrub import mapping, restore
+from ragkb.pipeline.scrub import mapping, restore, unresolved_tokens
 from ragkb.pipeline.units import Provenance, QAUnit, SOPUnit
 
 
@@ -149,6 +149,20 @@ def export_all(qa_units: list[QAUnit], sop_units: list[SOPUnit],
                  if (u.struct_ok and u.publication_status != "failed_review"
                      and u.semantic_ok is not False)]
     stats = ExportStats()
+
+    # Validate before clearing any previous artifact. A process that lost part of
+    # redaction_map.json must never publish opaque placeholders or overwrite the
+    # last known-good export with an incomplete one.
+    unresolved: set[str] = set()
+    for unit in qa_units:
+        unresolved.update(unresolved_tokens("\n".join(
+            [unit.query, unit.answer, *unit.paraphrases])))
+    for unit in sop_units:
+        unresolved.update(unresolved_tokens("\n".join(
+            [unit.title, unit.markdown, *unit.entry_questions])))
+    if unresolved:
+        sample = ", ".join(sorted(unresolved)[:10])
+        raise ValueError(f"redaction integrity failure: unresolved placeholders: {sample}")
 
     # Source-faithful output is the primary artifact. The opt-in expanded variant
     # is written separately so experiments cannot replace production input.
@@ -292,10 +306,7 @@ def load_results(output_dir: Path) -> tuple[list[QAUnit], list[SOPUnit]]:
     rmap = output_dir / "redaction_map.json"
     if rmap.is_file():
         from ragkb.pipeline import scrub
-        audit = json.loads(rmap.read_text("utf-8"))     # token → real value
-        for tok, val in audit.items():
-            scrub._DEFAULT._to_value[tok] = val
-            scrub._DEFAULT._to_token[val] = tok
+        scrub.load_mapping(rmap)
 
     data = json.loads((output_dir / "results.json").read_text("utf-8"))
     qa = [QAUnit(query=d["query"], answer=d["answer"],

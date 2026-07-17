@@ -35,7 +35,9 @@ def review_with_regeneration(units: list[QAUnit], llm: LLMClient, *,
     review_qa(units, llm, model=reviewer_model)
 
     for _ in range(max_attempts):
-        retryable = [u for u in units if not u.semantic_ok and u.review_attempts < max_attempts]
+        retryable = [u for u in units
+                     if (not u.semantic_ok and u.review_attempts < max_attempts
+                         and not u.semantic_reason.startswith("review_unavailable:"))]
         if not retryable:
             break
         for unit in retryable:
@@ -147,7 +149,8 @@ def review_sop_with_regeneration(units: list[SOPUnit], llm: LLMClient, *,
 
     for _ in range(max_attempts):
         retryable = [u for u in units
-                     if not u.semantic_ok and u.review_attempts < max_attempts]
+                     if (not u.semantic_ok and u.review_attempts < max_attempts
+                         and not u.semantic_reason.startswith("review_unavailable:"))]
         if not retryable:
             break
         for unit in retryable:

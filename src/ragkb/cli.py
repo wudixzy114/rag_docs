@@ -100,7 +100,8 @@ def serve(port: int = typer.Option(8000, help="仪表盘端口"),
           host: str = typer.Option("127.0.0.1")):
     """Launch the web dashboard."""
     import uvicorn
-    uvicorn.run("ragkb.server.app:app", host=host, port=port, log_level="info")
+    uvicorn.run("ragkb.server.app:create_app", factory=True,
+                host=host, port=port, log_level="info")
 
 
 def _print_event(ev):

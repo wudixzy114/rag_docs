@@ -346,9 +346,46 @@ def test_mask_covers_mac_ip_phone():
     assert "8.8.8.8" in r.mask("dns 8.8.8.8")
 
 
+def test_password_assignment_is_masked_and_persisted(tmp_path):
+    from ragkb.pipeline.scrub import Redactor
+    redactor = Redactor()
+    original = "Password: ea-ssh-0.1.2"
+    masked = redactor.mask(original)
+    assert "Password" not in masked and "ea-ssh-0.1.2" not in masked
+    path = tmp_path / "redaction_map.json"
+    redactor.save(path)
+    restored = Redactor()
+    restored.load(path)
+    assert restored.restore(masked) == original
+    assert path.stat().st_mode & 0o777 == 0o600
+    sensitive = "邮箱 user@git.jd.com, kafka_password=F99Cb1dnGCa4eWtp"
+    masked_sensitive = redactor.mask(sensitive)
+    assert "user@git.jd.com" not in masked_sensitive
+    assert "kafka_password" not in masked_sensitive
+
+
+def test_export_refuses_unresolved_redaction_before_overwriting(tmp_path):
+    old = tmp_path / "qa_pairs.csv"
+    old.write_text("known-good", "utf-8")
+    unit = QAUnit(query="问题", answer="连接 〔IP:abcdef〕",
+                  sources=[Provenance(topic="模块")])
+    import pytest
+    with pytest.raises(ValueError, match="redaction integrity failure"):
+        export_all([unit], [], tmp_path)
+    assert old.read_text("utf-8") == "known-good"
+
+
 def test_content_blocked_detector():
     from ragkb.llm.client import _is_content_blocked
     body = '{"error":{"code":400,"message":"sensitive contain:[\\"MAC地址\\"]","status":"FAILED_PRECONDITION"}}'
     assert _is_content_blocked(400, body)
     assert not _is_content_blocked(200, body)
     assert not _is_content_blocked(400, '{"error":"some other 400"}')
+
+
+def test_content_blocked_message_does_not_echo_secret():
+    from ragkb.pipeline.failures import sanitize_failure_message
+    raw = 'content blocked: sensitive contain:["密码",":Password: real-secret"]'
+    safe = sanitize_failure_message(raw)
+    assert "real-secret" not in safe
+    assert "password" in safe

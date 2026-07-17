@@ -52,6 +52,11 @@ class EventBus:
         self._journal_path = Path(journal_path) if journal_path else None
         if self._journal_path:
             self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self._journal_path.touch(exist_ok=True)
+            try:
+                self._journal_path.chmod(0o600)
+            except OSError:
+                pass
         # Monotonic wall-clock source injected so the pipeline never calls
         # time.time() itself in a way that complicates testing; default real.
         self._clock = time.time
@@ -129,32 +134,23 @@ def read_journal(path: "str | Path", offset: int = 0
         return [], offset
     complete = chunk[:last_nl]
     new_offset = offset + len(complete.encode("utf-8")) + 1  # +1 for the newline
-    # Line index within this journal, used to reassign a globally monotonic seq:
-    # each process writes its own per-process seq starting at 1, so raw seqs
-    # collide across a CLI run and a Web run. The journal's append order is the
-    # real order; keying seq off cumulative line count makes the browser's
-    # seq-based dedupe correct regardless of which process produced the event.
-    base = _count_lines(p, offset)
-    for i, line in enumerate(complete.splitlines()):
+    # Use each line's byte position as its cross-process monotonic sequence.
+    # Counting every preceding line on every 1s tail poll made a 16 MB journal get
+    # reread in full once per second (quadratic over a long run). Byte positions
+    # are already unique, ordered and available from the cursor at O(new data).
+    line_offset = offset
+    for line in complete.splitlines():
+        encoded_size = len(line.encode("utf-8")) + 1
         line = line.strip()
         if not line:
+            line_offset += encoded_size
             continue
         try:
             ev = json.loads(line)
         except (json.JSONDecodeError, ValueError):
+            line_offset += encoded_size
             continue
-        ev["seq"] = base + i + 1
+        ev["seq"] = line_offset + 1
         events.append(ev)
+        line_offset += encoded_size
     return events, new_offset
-
-
-def _count_lines(path: Path, upto_offset: int) -> int:
-    """Count complete lines in `path` before byte `upto_offset` — the number of
-    events already emitted, so the next batch continues the monotonic seq."""
-    if upto_offset <= 0:
-        return 0
-    try:
-        with open(path, "rb") as f:
-            return f.read(upto_offset).count(b"\n")
-    except OSError:
-        return 0

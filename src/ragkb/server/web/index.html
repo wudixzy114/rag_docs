@@ -53,6 +53,10 @@
   .status-dot.running { background:var(--accent); animation:pulse 1.2s infinite; }
   .status-dot.done { background:var(--ok); }
   .status-dot.failed { background:var(--error); }
+  .status-dot.interrupted { background:var(--warn); }
+  .status-dot.partial { background:var(--warn); }
+  .status-dot.awaiting_review { background:var(--warn); }
+  .status-dot.excluded { background:var(--quiet); }
   .status-dot.pinned { background:#6d4bb3; }
   .doc-name { min-width:0; flex:1; font-weight:600; font-size:13px; overflow-wrap:anywhere; }
   .doc-status { color:var(--muted); font-size:11px; flex:none; }
@@ -98,7 +102,7 @@
   .detail-title h1 { margin:0; font-size:18px; overflow-wrap:anywhere; }
   .detail-title p { margin:3px 0 0; color:var(--muted); font-size:12px; }
   .detail-actions { display:flex; gap:7px; }
-  .pipeline { padding:0 18px 16px; display:grid; grid-template-columns:repeat(7,minmax(78px,1fr)); }
+  .pipeline { padding:0 18px 16px; display:grid; grid-template-columns:repeat(8,minmax(68px,1fr)); }
   .stage { position:relative; padding:0 8px 0 0; min-width:0; }
   .stage:not(:last-child)::after { content:""; position:absolute; top:10px; left:22px; right:0; height:1px; background:var(--line); }
   .stage-node { width:21px; height:21px; position:relative; z-index:1; border:1px solid var(--line); background:var(--surface); display:grid; place-items:center; border-radius:50%; font-size:11px; color:var(--quiet); }
@@ -123,6 +127,16 @@
   .chip.warn { background:var(--warn-soft); color:var(--warn); }
   .chip.error { background:var(--error-soft); color:var(--error); }
   .reason { margin-top:8px; padding:8px 10px; border-left:3px solid var(--error); background:#fff8f7; color:#7e2d27; font-size:12px; white-space:pre-wrap; }
+  .decision-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:10px; }
+  .audit-stage { border-bottom:1px solid var(--line); }
+  .audit-stage summary { padding:12px 18px; cursor:pointer; display:flex; align-items:center; gap:10px; font-weight:600; }
+  .audit-stage summary span { color:var(--muted); font-size:11px; font-weight:400; }
+  .audit-body { padding:0 18px 18px; }
+  .audit-columns { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .audit-panel { min-width:0; }
+  .audit-label { color:var(--muted); font-size:11px; margin-bottom:4px; }
+  .audit-text { margin:0; padding:10px; max-height:380px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; background:#f6f8fa; border:1px solid var(--line); border-radius:4px; font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .audit-diff { margin-top:10px; }
   .empty { padding:48px 20px; color:var(--muted); text-align:center; }
   .event-list { padding-bottom:20px; }
   .event { padding:10px 12px; border-bottom:1px solid #edf0f3; }
@@ -158,6 +172,7 @@
     .detail-actions { flex-direction:column; }
     .tabs, .toolbar { padding-left:12px; padding-right:12px; }
     .unit-row { padding:12px; }
+    .audit-columns { grid-template-columns:1fr; }
   }
 </style>
 </head>
@@ -167,6 +182,7 @@
   <div class="connection" id="connection"><i></i><span>正在连接</span></div>
   <div class="header-spacer"></div>
   <div class="header-model" id="modelInfo" title="当前模型路由"></div>
+  <button class="btn" id="scanBtn" title="只执行预处理扫描，不调用模型"><span>⌁</span><span>预检</span></button>
   <button class="btn" id="exportBtn" title="导出已通过审核的结果"><span>⇩</span><span>导出</span></button>
   <button class="btn primary" id="runBtn" title="运行全部文档"><span>▶</span><span>运行全部</span></button>
 </header>
@@ -194,6 +210,8 @@
       <button class="tab active" data-tab="qa">QA <span id="qaCount">0</span></button>
       <button class="tab" data-tab="sop">SOP <span id="sopCount">0</span></button>
       <button class="tab" data-tab="failed">失败 <span id="failedCount">0</span></button>
+      <button class="tab" data-tab="decisions">人工待办 <span id="decisionCount">0</span></button>
+      <button class="tab" data-tab="audit">阶段审计</button>
     </nav>
     <div class="toolbar"><input id="unitSearch" placeholder="筛选当前结果"><span class="count" id="resultCount"></span></div>
     <section class="unit-list" id="unitList"></section>
@@ -208,11 +226,11 @@
 
 <script>
 const STAGES = [
-  ['parse','解析'], ['vision','图片'], ['classify','分类'], ['extract','抽取'],
+  ['preflight','预检'], ['parse','解析'], ['vision','图片'], ['classify','分类'], ['extract','抽取'],
   ['validate','校验'], ['regenerate','重生成'], ['review','审核']
 ];
-const STATUS_TEXT = {pending:'待处理',running:'运行中',done:'完成',failed:'失败',pinned:'已固定',skipped:'已跳过'};
-const S = {docs:{}, units:{}, stages:{}, events:[], errors:[], models:{}, usage:{}, lastRun:{}, concurrency:{}, selected:null, tab:'qa', running:false, seq:0};
+const STATUS_TEXT = {pending:'待处理',running:'运行中',done:'完成',failed:'失败',partial:'待自动恢复',pinned:'已固定',skipped:'已跳过',interrupted:'已中断',awaiting_review:'待人工',excluded:'已排除'};
+const S = {docs:{}, units:{}, stages:{}, events:[], errors:[], decisions:[], audits:{}, failureSummary:{}, models:{}, usage:{}, lastRun:{}, concurrency:{}, selected:null, tab:'qa', running:false, seq:0};
 const $ = selector => document.querySelector(selector);
 
 function esc(value) {
@@ -243,6 +261,8 @@ function hydrate(data) {
   S.docs = Object.fromEntries((data.docs || []).map(doc => [doc.topic, {...S.docs[doc.topic], ...doc}]));
   S.stages = data.stages || S.stages;
   S.errors = data.errors || [];
+  S.decisions = data.decisions || [];
+  S.failureSummary = data.failure_summary || {};
   S.models = data.models || {};
   S.usage = data.usage || {};
   S.lastRun = data.last_run || {};
@@ -299,6 +319,8 @@ function onEvent(event) {
     S.running = data.status === 'started';
     if (data.status === 'done' || data.status === 'failed') refreshState(true);
     if (data.status === 'exported') toast(`导出完成：${data.qa_units || 0} QA / ${data.sop_files || 0} SOP`);
+  } else if (event.kind === 'decision_required' || event.kind === 'human_decision') {
+    refreshState(true);
   }
   render();
 }
@@ -313,22 +335,29 @@ function renderTotalProgress() {
   // Each doc contributes an equal 1/total slice. done/pinned/skipped = full;
   // running = its per-stage progress fraction; failed counts as resolved (not
   // stuck) but is surfaced separately in red; pending = 0.
-  const DONE = new Set(['done','pinned','skipped']);
+  const DONE = new Set(['done','pinned','skipped','excluded']);
   let doneUnits = 0, runningUnits = 0, failedCount = 0, doneCount = 0, runningCount = 0, pendingCount = 0;
   for (const doc of docs) {
     const status = doc.status || 'pending';
     if (DONE.has(status)) { doneUnits += 1; doneCount += 1; }
-    else if (status === 'failed') { failedCount += 1; }
+    else if (status === 'failed' || status === 'interrupted' || status === 'partial') { failedCount += 1; }
     else if (status === 'running') { runningUnits += docProgress(doc.topic) / 100; runningCount += 1; }
     else { pendingCount += 1; }
   }
   const donePct = doneUnits / total * 100;
   const runningPct = runningUnits / total * 100;
   const failedPct = failedCount / total * 100;
-  const overall = Math.round(donePct + runningPct + failedPct);
+  let overall = Math.round(donePct + runningPct + failedPct);
+  // A run isn't complete until the cross-doc consolidate/review/export phase
+  // finishes, but per-doc statuses can all read done/failed before then (docs
+  // only flip to 'done' inside consolidate). Don't show a finished 100% while
+  // the run is still flagged in-flight — cap at 99% and label the tail phase.
+  const runInFlight = S.running || S.lastRun?.status === 'started';
+  let tailNote = '';
+  if (runInFlight && overall >= 100) { overall = 99; tailNote = ' · 集约/审核中'; }
   node.innerHTML = `
     <div class="tp-head">
-      <span class="tp-title">总进度 · <b>${doneCount}</b>/${total} 篇完成${runningCount?` · ${runningCount} 运行中`:''}${failedCount?` · ${failedCount} 失败`:''}</span>
+      <span class="tp-title">总进度 · <b>${doneCount}</b>/${total} 篇完成${runningCount?` · ${runningCount} 运行中`:''}${failedCount?` · ${failedCount} 失败`:''}${tailNote}</span>
       <span class="tp-pct">${overall}<span>%</span></span>
     </div>
     <div class="tp-bar">
@@ -372,7 +401,7 @@ function renderConcurrency() {
     </div>`;
 }
 function renderHeader() {
-  $('#runBtn').disabled = S.running; $('#exportBtn').disabled = S.running;
+  $('#runBtn').disabled = S.running; $('#exportBtn').disabled = S.running; $('#scanBtn').disabled = S.running;
   $('#runBtn').innerHTML = S.running ? '<span>●</span><span>运行中</span>' : '<span>▶</span><span>运行全部</span>';
   $('#modelInfo').textContent = S.models.extract ? `抽取 ${S.models.extract} · 审核 ${S.models.review}` : '';
 }
@@ -380,10 +409,10 @@ function renderMetrics() {
   const docs = Object.values(S.docs), units = Object.values(S.units).flat();
   const values = [
     ['文档', `${docs.filter(d=>d.status==='done').length}/${docs.length}`],
+    ['人工待办', S.decisions.filter(d=>d.status==='pending').length],
     ['已批准 QA', units.filter(approved).length],
     ['审核失败', units.filter(failed).length],
     ['SOP', units.filter(u=>u.unit_kind==='sop').length],
-    ['模型调用', fmtNum(S.lastRun.calls ?? S.usage.calls)],
   ];
   $('#metrics').innerHTML = values.map(([label,value]) => `<div class="metric"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join('');
 }
@@ -395,7 +424,7 @@ function docProgress(topic) {
 function renderDocs() {
   const query = $('#docSearch').value.trim().toLowerCase();
   const docs = Object.values(S.docs).filter(doc => !query || doc.topic.toLowerCase().includes(query)).sort((a,b) => {
-    const rank={running:0,failed:1,pending:2,done:3,pinned:4,skipped:5}; return (rank[a.status]??9)-(rank[b.status]??9)||a.topic.localeCompare(b.topic);
+    const rank={running:0,awaiting_review:1,partial:2,failed:3,interrupted:4,pending:5,done:6,pinned:7,excluded:8,skipped:9}; return (rank[a.status]??10)-(rank[b.status]??10)||a.topic.localeCompare(b.topic);
   });
   $('#docCount').textContent = `${docs.length} 篇`;
   $('#docList').innerHTML = docs.length ? docs.map(doc => {
@@ -416,13 +445,16 @@ function renderDetail() {
   $('#pinBtn').textContent = doc?.pinned ? '◆' : '◇'; $('#pinBtn').title = doc?.pinned ? '取消固定' : '固定文档';
   renderPipeline(topic);
   const qa = units.filter(approved), sop = units.filter(u=>u.unit_kind==='sop'), bad = units.filter(failed);
-  $('#qaCount').textContent=qa.length; $('#sopCount').textContent=sop.length; $('#failedCount').textContent=bad.length;
+  const decisions=S.decisions.filter(item=>item.status==='pending'&&(!topic||item.topic===topic));
+  $('#qaCount').textContent=qa.length; $('#sopCount').textContent=sop.length; $('#failedCount').textContent=bad.length; $('#decisionCount').textContent=decisions.length;
   const lastError = [...S.errors].reverse().find(error => !topic || error.topic===topic);
   const banner = $('#errorBanner');
   if (lastError) { banner.style.display='block'; banner.textContent=`${lastError.topic || '流水线'}：${lastError.data?.message || '未知错误'}`; }
   else if (doc?.error) { banner.style.display='block'; banner.textContent=doc.error; }
   else banner.style.display='none';
-  renderUnits({qa,sop,failed:bad}[S.tab] || qa);
+  if (S.tab==='decisions') renderDecisions(decisions);
+  else if (S.tab==='audit') renderAudit(topic);
+  else renderUnits({qa,sop,failed:bad}[S.tab] || qa);
 }
 function renderPipeline(topic) {
   const stages = topic ? (S.stages[topic] || {}) : {};
@@ -449,6 +481,38 @@ function renderUnits(list) {
       <div class="unit-meta"><span>重生成 ${unit.review_attempts||0}/1</span>${source?`<span>${esc(source.heading_path||source.doc_title||source.topic)}</span>`:''}${unit.review_history?.length?`<span class="chip warn">初审：${esc(unit.review_history[0])}</span>`:''}</div></article>`;
   }).join('');
 }
+function renderDecisions(list) {
+  $('#resultCount').textContent=`${list.length} 项`;
+  if (!list.length) { $('#unitList').innerHTML='<div class="empty">当前范围没有人工待办</div>'; return; }
+  const labels={include:'纳入流水线',exclude:'排除',retry:'自动重试',accept:'接受现状'};
+  $('#unitList').innerHTML=list.map(item=>`<article class="unit-row">
+    <div class="unit-top"><div class="unit-title">${esc(item.topic)}</div><span class="chip warn">${esc(item.stage)}</span></div>
+    <div class="unit-answer">${esc(item.reason)}</div>
+    <div class="unit-meta">${(item.evidence||[]).map(value=>`<span>${esc(value)}</span>`).join('')}</div>
+    <div class="decision-actions">${(item.options||[]).map(action=>`<button class="btn ${action===item.recommended_action?'primary':''}" data-decision="${esc(item.decision_id)}" data-action="${esc(action)}">${esc(labels[action]||action)}</button>`).join('')}</div>
+  </article>`).join('');
+}
+async function loadAudit(topic) {
+  if (!topic || S.audits[topic]) return;
+  try { const response=await fetch('/api/audit?topic='+encodeURIComponent(topic),{cache:'no-store'}); if(!response.ok)throw new Error(`HTTP ${response.status}`); S.audits[topic]=await response.json(); renderDetail(); }
+  catch(error){toast('审计记录读取失败：'+error.message,true);}
+}
+function renderAudit(topic) {
+  $('#resultCount').textContent='';
+  if (!topic) { $('#unitList').innerHTML='<div class="empty">请先选择一篇文档查看阶段审计</div>'; return; }
+  const audit=S.audits[topic];
+  if (!audit) { $('#unitList').innerHTML='<div class="empty">正在读取审计记录</div>'; loadAudit(topic); return; }
+  const stages=audit.stages||{}, rows=[];
+  for (const [stage,attempts] of Object.entries(stages)) for (const item of attempts) rows.push([stage,item]);
+  if (!rows.length) { $('#unitList').innerHTML='<div class="empty">该文档尚无审计记录</div>'; return; }
+  $('#unitList').innerHTML=rows.map(([stage,item],index)=>`<details class="audit-stage" ${index===rows.length-1?'open':''}>
+    <summary>${esc(stage)} · 第 ${item.attempt} 次 <span>${esc(item.status)} · ${fmtNum(item.input_chars)} → ${fmtNum(item.output_chars)} 字符 · ${fmtTime(item.ts)}</span></summary>
+    <div class="audit-body">${item.error?`<div class="reason">${esc(item.error)}</div>`:''}<div class="audit-columns">
+      <div class="audit-panel"><div class="audit-label">输入 · ${esc(item.input_sha)}</div><pre class="audit-text">${esc(item.input_text)}</pre></div>
+      <div class="audit-panel"><div class="audit-label">输出 · ${esc(item.output_sha)}</div><pre class="audit-text">${esc(item.output_text)}</pre></div>
+    </div><div class="audit-diff"><div class="audit-label">文本差异</div><pre class="audit-text">${esc(item.diff||'无文本差异')}</pre></div></div>
+  </details>`).join('');
+}
 function renderEvents() {
   const events=S.events.slice(-120).reverse(); $('#eventCount').textContent=`${events.length} 条`;
   $('#eventList').innerHTML=events.length ? events.map(event => {
@@ -466,10 +530,12 @@ function renderEvents() {
 
 $('#docSearch').addEventListener('input',renderDocs);
 $('#unitSearch').addEventListener('input',renderDetail);
-$('#docList').addEventListener('click',event=>{ const row=event.target.closest('[data-topic]'); if(row){S.selected=row.dataset.topic;render();} });
-$('#tabs').addEventListener('click',event=>{ const tab=event.target.closest('[data-tab]'); if(!tab)return; S.tab=tab.dataset.tab; document.querySelectorAll('.tab').forEach(node=>node.classList.toggle('active',node===tab)); renderDetail(); });
+$('#docList').addEventListener('click',event=>{ const row=event.target.closest('[data-topic]'); if(row){S.selected=row.dataset.topic;if(S.tab==='audit')loadAudit(S.selected);render();} });
+$('#tabs').addEventListener('click',event=>{ const tab=event.target.closest('[data-tab]'); if(!tab)return; S.tab=tab.dataset.tab; document.querySelectorAll('.tab').forEach(node=>node.classList.toggle('active',node===tab)); if(S.tab==='audit')loadAudit(S.selected);renderDetail(); });
+$('#unitList').addEventListener('click',async event=>{const button=event.target.closest('[data-decision]');if(!button)return;button.disabled=true;try{await api('/api/decisions/resolve',{decision_id:button.dataset.decision,action:button.dataset.action});delete S.audits[S.selected];await refreshState(true);toast('人工决策已保存');}catch(_){button.disabled=false;}});
 $('#runBtn').addEventListener('click',async()=>{ try{await api('/api/run',{});S.running=true;renderHeader();toast('流水线已启动');}catch(_){} });
 $('#exportBtn').addEventListener('click',async()=>{ try{const data=await api('/api/export',{});toast(`已导出 ${data.stats?.qa_units||0} 条 QA`);}catch(_){} });
+$('#scanBtn').addEventListener('click',async()=>{try{const data=await api('/api/preflight/scan',{});await refreshState(true);toast(`预检完成：${data.summary?.awaiting_review||0} 项待人工确认`);}catch(_){}});
 $('#retryBtn').addEventListener('click',async()=>{ if(!S.selected)return;try{await api('/api/retry',{topics:[S.selected]});S.running=true;renderHeader();toast(`已重试 ${S.selected}`);}catch(_){} });
 $('#pinBtn').addEventListener('click',async()=>{ const doc=S.docs[S.selected];if(!doc)return;try{await api('/api/pin',{topic:doc.topic,pinned:!doc.pinned});doc.pinned=!doc.pinned;render();}catch(_){} });
 

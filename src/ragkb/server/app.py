@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections import Counter
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,6 +26,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from ragkb.config import get_settings
 from ragkb.pipeline.events import EventBus, read_journal
+from ragkb.pipeline.failures import sanitize_failure_message
 from ragkb.pipeline.orchestrator import Orchestrator
 
 _WEB_DIR = Path(__file__).parent / "web"
@@ -69,7 +71,12 @@ def create_app() -> FastAPI:
 
     @app.get("/api/state")
     def api_state():
+        # A CLI run in another process appends docs to manifest.json; re-read it so
+        # an appended batch enlarges the total instead of leaving the bar at 100%.
+        orch.manifest.reload()
         docs = [d.to_dict() for d in orch.manifest.all()]
+        orch.decisions.reload()
+        decisions = [item.to_dict() for item in orch.decisions.all()]
         results_path = settings.output_dir / "results.json"
         results = {}
         if results_path.is_file():
@@ -91,6 +98,7 @@ def create_app() -> FastAPI:
         concurrency = {}
         state_events = []
         for event in journal_events:
+            event = _safe_event(event)
             if event.get("kind") == "concurrency":
                 concurrency = {**(event.get("data") or {}), "ts": event.get("ts")}
             else:
@@ -119,6 +127,11 @@ def create_app() -> FastAPI:
         # spam and without evicting real events.
         return JSONResponse({
             "docs": docs, "results": results, "running": running,
+            "decisions": decisions,
+            "failure_summary": dict(Counter(
+                doc.get("error_code") or "unknown" for doc in docs
+                if doc.get("status") in {
+                    "failed", "interrupted", "awaiting_review", "partial"})),
             "stages": stages, "errors": errors[-50:], "last_run": last_run,
             "concurrency": concurrency,
             "events": state_events[-300:],
@@ -143,8 +156,9 @@ def create_app() -> FastAPI:
         # concurrency sample. Replaying raw tail would be ~all concurrency spam
         # (it fires ~1/s), starving the client of the stage/doc_status events it
         # needs to rebuild progress on (re)connect.
-        non_hb = [e for e in all_events if e.get("kind") != "concurrency"]
-        latest_hb = next((e for e in reversed(all_events)
+        non_hb = [_safe_event(e) for e in all_events
+                  if e.get("kind") != "concurrency"]
+        latest_hb = next((_safe_event(e) for e in reversed(all_events)
                           if e.get("kind") == "concurrency"), None)
         backlog = non_hb[-300:]
         if latest_hb is not None:
@@ -163,7 +177,7 @@ def create_app() -> FastAPI:
                     if new_events:
                         idle = 0
                         for ev in new_events:
-                            yield {"data": json.dumps(ev, ensure_ascii=False)}
+                            yield {"data": json.dumps(_safe_event(ev), ensure_ascii=False)}
                     else:
                         idle += 1
                         if idle >= 5:      # ~a ping every 5 idle polls (5s)
@@ -190,6 +204,7 @@ def create_app() -> FastAPI:
             if state["running"]:
                 raise HTTPException(status_code=409,
                                     detail="cannot export while pipeline is running")
+            orch.reload_results()
             stats = orch.export()
         return {"ok": True, "stats": stats.__dict__}
 
@@ -206,9 +221,46 @@ def create_app() -> FastAPI:
     async def api_retry(request: Request):
         body = await _json(request)
         topics = body.get("topics") or []
+        if not topics:
+            orch.manifest.reload()
+            topics = [item.topic for item in orch.manifest.all()
+                      if item.retryable and item.status in {
+                          "failed", "interrupted", "pending", "partial"}]
+        if not topics:
+            return {"ok": True, "started": False, "topics": []}
         if not _start_run(only=topics, force=True):
             raise HTTPException(status_code=409, detail="pipeline is already running")
-        return {"ok": True}
+        return {"ok": True, "started": True, "topics": topics}
+
+    @app.post("/api/preflight/scan")
+    async def api_preflight_scan(request: Request):
+        body = await _json(request)
+        with run_lock:
+            if state["running"]:
+                raise HTTPException(status_code=409,
+                                    detail="cannot scan while pipeline is running")
+            summary = orch.scan_preflight(only=body.get("only"),
+                                          force=bool(body.get("force", False)))
+        return {"ok": True, "summary": summary}
+
+    @app.post("/api/decisions/resolve")
+    async def api_resolve_decision(request: Request):
+        body = await _json(request)
+        decision_id = str(body.get("decision_id") or "")
+        action = str(body.get("action") or "")
+        try:
+            result = orch.resolve_decision(decision_id, action)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="decision not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, **result}
+
+    @app.get("/api/audit")
+    def api_audit(topic: str):
+        if not topic:
+            raise HTTPException(status_code=400, detail="topic is required")
+        return JSONResponse(orch.audit.get(topic))
 
     return app
 
@@ -218,6 +270,17 @@ async def _json(request: Request) -> dict:
         return await request.json()
     except (json.JSONDecodeError, ValueError):
         return {}
+
+
+def _safe_event(event: dict) -> dict:
+    """Do not echo sensitive gateway response fragments through the dashboard."""
+    clean = dict(event)
+    data = dict(clean.get("data") or {})
+    for field in ("message", "detail"):
+        if field in data:
+            data[field] = sanitize_failure_message(str(data[field]))
+    clean["data"] = data
+    return clean
 
 
 def _public_results(data: dict) -> dict:
@@ -231,6 +294,3 @@ def _public_results(data: dict) -> dict:
                 for source in item.get("sources", [])]
             clean[kind].append(row)
     return clean
-
-
-app = create_app()

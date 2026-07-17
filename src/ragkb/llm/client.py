@@ -40,6 +40,14 @@ class LLMError(RuntimeError):
     """Raised when the gateway cannot produce a completion after retries."""
 
 
+class LLMOutputError(LLMError):
+    """The gateway replied, but the structured output could not be parsed."""
+
+    def __init__(self, message: str, raw_text: str = "") -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+
+
 class _GatewayCongestionError(LLMError):
     """Transient gateway overload used as congestion feedback by the client."""
 
@@ -319,6 +327,10 @@ class LLMClient:
         # verified), so each model gets its own AIMD window and the scheduler runs
         # the model group concurrently — aggregate throughput ≈ sum of windows.
         self._windows = _PerModelWindows(self.settings.max_concurrency)
+        # max_concurrency is a job-wide safety ceiling. Per-model windows decide
+        # distribution inside this cap; without this guard N models multiplied the
+        # configured limit by N (observed 15 concurrent calls with a limit of 4).
+        self._global_slots = threading.BoundedSemaphore(self.settings.max_concurrency)
         self._usage_lock = threading.Lock()
         self.total_usage = LLMUsage()
 
@@ -330,7 +342,11 @@ class LLMClient:
         """Live scheduler snapshot for the dashboard. Now fleet-wide: aggregate
         in-flight across all per-model windows, plus a per-model breakdown, so the
         gauge reflects the multi-model scheduler's real concurrency."""
-        return self._windows.aggregate_stats()
+        stats = self._windows.aggregate_stats()
+        stats["limit"] = min(self.settings.max_concurrency, stats["limit"])
+        stats["window"] = stats["limit"]
+        stats["maximum"] = self.settings.max_concurrency
+        return stats
 
     def close(self) -> None:
         if self._owns_client:
@@ -420,6 +436,7 @@ class LLMClient:
             self._local.effective_model = model
             window = self._windows.window(model)
             successful = False
+            self._global_slots.acquire()
             window.acquire()
             try:
                 res = fn()
@@ -435,6 +452,7 @@ class LLMClient:
                 continue
             finally:
                 window.release(successful=successful)
+                self._global_slots.release()
                 self._local.effective_model = None
         raise last_quota or LLMError("no model available in fallback chain")
 
@@ -722,7 +740,7 @@ class LLMClient:
                     # Content-safety refusal is deterministic — retrying the same
                     # content always 400s. Surface immediately (no retry, no
                     # fallback: the filter is gateway-wide).
-                    raise LLMContentBlockedError(f"content blocked: {resp.text[:200]}")
+                    raise LLMContentBlockedError("content blocked by gateway safety filter")
                 if resp.status_code == 429 or resp.status_code >= 500:
                     raise _GatewayCongestionError(
                         f"gateway {resp.status_code}: {resp.text[:200]}")
@@ -764,6 +782,9 @@ class LLMClient:
                             continue
                         if resp.status_code == 429 and _is_quota_body(body):
                             raise LLMQuotaError(f"quota exhausted: {body}")
+                        if _is_content_blocked(resp.status_code, body):
+                            raise LLMContentBlockedError(
+                                "content blocked by gateway safety filter")
                         if resp.status_code == 429 or resp.status_code >= 500:
                             self._active_window().congestion()
                         raise LLMError(f"gateway {resp.status_code}: {body}")
@@ -820,7 +841,7 @@ class LLMClient:
                 if resp.status_code == 429 and _is_quota_body(resp.text):
                     raise LLMQuotaError(f"quota exhausted: {resp.text[:200]}")
                 if _is_content_blocked(resp.status_code, resp.text):
-                    raise LLMContentBlockedError(f"content blocked: {resp.text[:200]}")
+                    raise LLMContentBlockedError("content blocked by gateway safety filter")
                 if resp.status_code == 429 or resp.status_code >= 500:
                     raise _GatewayCongestionError(
                         f"gateway {resp.status_code}: {resp.text[:200]}")
@@ -864,7 +885,7 @@ class LLMClient:
                     # the fallback loop so it switches models immediately.
                     raise LLMQuotaError(f"quota exhausted: {resp.text[:200]}")
                 if _is_content_blocked(resp.status_code, resp.text):
-                    raise LLMContentBlockedError(f"content blocked: {resp.text[:200]}")
+                    raise LLMContentBlockedError("content blocked by gateway safety filter")
                 if resp.status_code == 429 or resp.status_code >= 500:
                     raise _GatewayCongestionError(
                         f"gateway {resp.status_code}: {resp.text[:200]}")

@@ -9,11 +9,12 @@ import pytest
 from pathlib import Path
 
 from ragkb.config import LLMSettings
-from ragkb.llm.client import LLMError, LLMResult, LLMUsage, LLMClient
+from ragkb.llm.client import LLMError, LLMQuotaError, LLMResult, LLMUsage, LLMClient
 from ragkb.parse.model import Image, Section
 from ragkb.parse.markdown import parse_document
 from ragkb.parse.source import load_source, source_bundle_sha
 from ragkb.pipeline.batching import pack_by_size
+from ragkb.pipeline.control import DecisionStore, inspect_preflight
 from ragkb.pipeline.classify import classify_sections
 from ragkb.pipeline.gate_semantic import review_qa, review_sop
 from ragkb.pipeline.extract import extract_qa
@@ -24,6 +25,7 @@ from ragkb.pipeline.units import Provenance, QAUnit, SOPUnit
 from ragkb.pipeline.vision import vision_read_image
 from ragkb.server.app import _public_results
 from ragkb.store.cache import Cache
+from ragkb.store.manifest import DocState, Manifest
 
 
 def test_headerless_document_is_not_dropped(tmp_path):
@@ -297,6 +299,60 @@ def test_extraction_failure_is_not_silently_treated_as_empty(tmp_path):
         extract_qa(doc, section, _InvalidJSONLLM())
 
 
+def test_model_json_parser_repairs_literal_newlines_and_trailing_commas():
+    from ragkb.pipeline.jsonutil import parse_json_array, parse_json_object
+    assert parse_json_object('说明\n```json\n{"markdown":"# 标题\n正文",}\n```') == {
+        "markdown": "# 标题\n正文"}
+    assert parse_json_array('result: [{"id": 1,},] end') == [{"id": 1}]
+
+
+def test_preflight_only_quarantines_document_level_markers(tmp_path):
+    private = tmp_path / "【已私密】方案.md"
+    private.write_text("# 方案\n正文", "utf-8")
+    flags, evidence = inspect_preflight(private)
+    assert flags == ["private"] and evidence
+
+    ordinary = tmp_path / "迁移指南.md"
+    ordinary.write_text("# 迁移指南\n旧 API 已废弃，请使用新 API。", "utf-8")
+    assert inspect_preflight(ordinary) == ([], [])
+
+    restricted = tmp_path / "[仅协作人访问]部署指南.md"
+    restricted.write_text("# 部署指南\n正文", "utf-8")
+    assert inspect_preflight(restricted)[0] == ["private"]
+
+
+def test_decision_and_interrupted_state_survive_process_restart(tmp_path):
+    store = DecisionStore(tmp_path / "decisions.json")
+    item = store.propose("私密文档", "preflight", reason="private",
+                         evidence=["【已私密】"], options=["include", "exclude"])
+    store.resolve(item.decision_id, "exclude")
+    assert DecisionStore(tmp_path / "decisions.json").get(item.decision_id).selected_action == "exclude"
+
+    manifest = Manifest(tmp_path / "manifest.json")
+    manifest.upsert(DocState(topic="中断文档", status="running", current_stage="extract"))
+    assert manifest.recover_interrupted() == ["中断文档"]
+    recovered = Manifest(tmp_path / "manifest.json").get("中断文档")
+    assert recovered.status == "interrupted" and recovered.retryable
+
+
+def test_quota_unavailable_review_does_not_enter_regeneration_loop():
+    class _QuotaLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            raise LLMQuotaError("quota exhausted")
+
+    llm = _QuotaLLM()
+    unit = QAUnit(query="问题", answer="答案",
+                  sources=[Provenance(source_excerpt="证据")])
+    review_with_regeneration([unit], llm, max_attempts=1)
+    assert llm.calls == 1
+    assert unit.semantic_reason == "review_unavailable:no_quota"
+    assert unit.review_attempts == 0
+
+
 def test_gemini_defaults_route_fast_and_complex_tasks():
     settings = LLMSettings(
         XIAOSHU_MODEL="Gemini-3.1-Pro-Preview-joybuilder",
@@ -346,6 +402,22 @@ def test_llm_client_enforces_global_concurrency_limit():
         [future.result() for future in futures]
     assert client.peak == 2
     assert client.total_usage.calls == 8
+
+
+def test_llm_global_limit_is_not_multiplied_by_model_count():
+    settings = LLMSettings(
+        XIAOSHU_MODEL="Model-A", JD_LLM_FALLBACK_MODELS="",
+        JD_LLM_TASK_MODELS="", JD_LLM_MAX_CONCURRENCY=2)
+    client = _ConcurrencyLLM(settings)
+    models = ["Model-A", "Model-B", "Model-C", "Model-D"]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(client.complete, system="s", user="u",
+                               model=models[i % len(models)]) for i in range(8)]
+        assert client.first_started.wait(timeout=1)
+        client.release_first.set()
+        [future.result() for future in futures]
+    assert client.peak <= 2
+    assert client.concurrency_stats()["maximum"] == 2
 
 
 def test_llm_client_uses_multiplicative_decrease_on_gateway_congestion(monkeypatch):
