@@ -78,6 +78,18 @@ def export(with_paraphrase: bool = typer.Option(
         f"SOP {stats.sop_files}，待复核 {stats.needs_review}，模块 {stats.modules}")
 
 
+@app.command("clean-results")
+def clean_results_command():
+    """Snapshot and quarantine unpublished/corrupt results non-destructively."""
+    settings = get_settings()
+    from ragkb.pipeline.maintenance import clean_results
+    stats = clean_results(settings.output_dir)
+    typer.echo(
+        f"已隔离 QA {stats['quarantined_qa']} / SOP {stats['quarantined_sop']}，"
+        f"活动结果保留 QA {stats['active_qa']} / SOP {stats['active_sop']}，"
+        f"快照: {stats['snapshot']}")
+
+
 @app.command()
 def merge(subdir: str = typer.Option(
         "upload_sop", help="合并文件的输出子目录（相对 output/）")):

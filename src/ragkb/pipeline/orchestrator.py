@@ -76,7 +76,7 @@ def discover_topics(input_dir: Path) -> list[Path]:
 
 def _topic_for(path: Path, input_dir: Path) -> str:
     """Stable human-readable document key, compatible with 原始文档.md layouts."""
-    if path.stem.lower() in {"原始文档", "index"} and path.parent != input_dir:
+    if path.stem.lower() in {"原始文档", "index"}:
         return path.parent.name
     parent = path.parent.name if path.parent != input_dir else ""
     return f"{parent}__{path.stem}" if parent else path.stem

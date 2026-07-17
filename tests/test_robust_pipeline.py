@@ -60,6 +60,15 @@ def test_recursive_discovery_accepts_arbitrary_names_and_formats(tmp_path):
     assert found == {"guide.md", "notes.txt", "page.html", "manual.docx", "book.pdf"}
 
 
+def test_original_document_topic_uses_input_directory_name(tmp_path):
+    path = tmp_path / "9n-llm-pdf"
+    path.mkdir()
+    source = path / "原始文档.md"
+    source.write_text("# 标题\n正文", "utf-8")
+    from ragkb.pipeline.orchestrator import _topic_for
+    assert _topic_for(source, path) == "9n-llm-pdf"
+
+
 def test_source_hash_changes_when_referenced_assets_change(tmp_path):
     source = tmp_path / "guide.md"
     source.write_text("# Guide\n![](images/screen.png)", "utf-8")

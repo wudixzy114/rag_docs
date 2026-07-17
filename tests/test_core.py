@@ -389,3 +389,26 @@ def test_content_blocked_message_does_not_echo_secret():
     safe = sanitize_failure_message(raw)
     assert "real-secret" not in safe
     assert "password" in safe
+
+
+def test_clean_results_snapshots_and_quarantines_unpublished_rows(tmp_path):
+    import json
+    from ragkb.pipeline.maintenance import clean_results
+    payload = {
+        "qa": [
+            {"query": "保留", "answer": "答案", "semantic_ok": True,
+             "publication_status": "approved"},
+            {"query": "隔离", "answer": "答案", "semantic_ok": False,
+             "publication_status": "failed_review"}],
+        "sop": [{"title": "保留", "markdown": "# 保留", "struct_ok": True,
+                 "semantic_ok": True, "publication_status": "approved"},
+                {"title": "隔离", "markdown": "# 隔离", "struct_ok": True,
+                 "semantic_ok": False, "publication_status": "failed_review"}],
+    }
+    (tmp_path / "results.json").write_text(json.dumps(payload), "utf-8")
+    stats = clean_results(tmp_path)
+    active = json.loads((tmp_path / "results.json").read_text())
+    assert stats["active_qa"] == stats["active_sop"] == 1
+    assert stats["quarantined_qa"] == stats["quarantined_sop"] == 1
+    assert len(active["qa"]) == len(active["sop"]) == 1
+    assert list((tmp_path / "recovery-snapshots").iterdir())
