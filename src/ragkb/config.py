@@ -1,7 +1,7 @@
 """Configuration for the RAG knowledge-base pipeline.
 
 Two settings groups:
-- `LLMSettings` — the internal 京东 OpenAI-compatible gateway. Vendored verbatim
+- `LLMSettings` — the internal OpenAI-compatible gateway. Vendored verbatim
   from magnus-lens: model-agnostic, dual-dialect (OpenAI + Anthropic), per-model
   quota fallback, per-task routing. The pipeline's parallelism relies on the
   client being thread-safe (thread-local active model), so this class is the
@@ -102,7 +102,7 @@ class Settings(BaseSettings):
 
 
 class LLMSettings(BaseSettings):
-    """Internal 京东 OpenAI-compatible gateway. Model-agnostic / hot-swappable.
+    """Internal OpenAI-compatible gateway. Model-agnostic / hot-swappable.
 
     Uses the JD_LLM_* names already present in .env rather than the RAGKB_
     prefix, so ops can reuse the department-standard variables.

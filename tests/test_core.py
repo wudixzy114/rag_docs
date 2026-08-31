@@ -358,9 +358,9 @@ def test_password_assignment_is_masked_and_persisted(tmp_path):
     restored.load(path)
     assert restored.restore(masked) == original
     assert path.stat().st_mode & 0o777 == 0o600
-    sensitive = "邮箱 user@git.jd.com, kafka_password=F99Cb1dnGCa4eWtp"
+    sensitive = "邮箱 user@internal.example.com, kafka_password=F99Cb1dnGCa4eWtp"
     masked_sensitive = redactor.mask(sensitive)
-    assert "user@git.jd.com" not in masked_sensitive
+    assert "user@internal.example.com" not in masked_sensitive
     assert "kafka_password" not in masked_sensitive
 
 

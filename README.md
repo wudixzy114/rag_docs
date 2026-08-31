@@ -28,7 +28,7 @@ discover topics
 - **断点续跑**（`manifest`）：已 pinned 的文档永远不被覆盖，幂等
 - **可观测性**（`EventBus` + `events.jsonl`）：CLI / 仪表板跨进程共享同一份事件流
 
-LLM 走的是**京东内部 LLM 网关**（`JD_LLM_BASE_URL` OpenAI 兼容），支持多模型 fallback（`JD_LLM_FALLBACK_MODELS` 链：Gemini-3.1-Pro-Preview → Gemini-3-Flash-Preview → Claude-Sonnet-4.6 → Claude-Opus-4.6 → Claude-Opus-4.7）。网关限流是 per-model 独立桶，所以多模型并行≈各模型限流桶之和。
+LLM 走的是**内部 LLM 多模型网关**（`JD_LLM_BASE_URL` OpenAI 兼容），支持多模型 fallback（`JD_LLM_FALLBACK_MODELS` 链：Gemini-3.1-Pro-Preview → Gemini-3-Flash-Preview → Claude-Sonnet-4.6 → Claude-Opus-4.6 → Claude-Opus-4.7）。网关限流是 per-model 独立桶，所以多模型并行≈各模型限流桶之和。
 
 ## 仓库结构
 
